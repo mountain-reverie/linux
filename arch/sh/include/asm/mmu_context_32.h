@@ -25,6 +25,14 @@ static inline u16 jcore_encode_asid_tag(u16 asid, u64 gen)
 
 static inline void set_asid(unsigned long asid)
 {
+	/*
+	 * TODO(SP2/SP3): generation is hardcoded 0 here — the ASID_TAG gen_low
+	 * nibble is not yet live. Threading the real generation into the tag must
+	 * land together with ASID rollover + TSB rebuild-on-wrap (the consumer),
+	 * per hardware-spec §2.1a and security-review S-I3. Until then stale-TSB
+	 * rejection relies on TLB flush only. Do NOT treat ASID as fully generation-
+	 * tagged until this is done.
+	 */
 	unsigned long tag = jcore_encode_asid_tag(asid, 0);
 
 	__asm__ __volatile__ ("ldc %0, asidr"
