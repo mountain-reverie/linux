@@ -23,6 +23,8 @@
  */
 #ifdef CONFIG_CPU_HAS_PTEAEX
 #define MMU_CONTEXT_ASID_MASK		0x0000ffff
+#elif defined(CONFIG_CPU_JCORE)
+#define MMU_CONTEXT_ASID_MASK		0x00000fff
 #else
 #define MMU_CONTEXT_ASID_MASK		0x000000ff
 #endif
@@ -136,12 +138,40 @@ static inline void switch_mm(struct mm_struct *prev,
 
 #endif /* CONFIG_MMU */
 
-#if defined(CONFIG_CPU_SH3) || defined(CONFIG_CPU_SH4)
+#if defined(CONFIG_CPU_SH3) || defined(CONFIG_CPU_SH4) || defined(CONFIG_CPU_JCORE)
 /*
  * If this processor has an MMU, we need methods to turn it off/on ..
  * paging_init() will also have to be updated for the processor in
  * question.
  */
+#if defined(CONFIG_CPU_JCORE)
+/*
+ * J-Core J4 MMUCR: AT (bit0) enables translation, TI (bit2) is a
+ * write-1-to-flush-all-TLB-entries strobe (hardware-spec.md §2.3,
+ * linux-spec.md §7.1). enable_mmu() sets AT and pulses TI so the MMU
+ * comes up with a clean TLB; disable_mmu() clears AT and pulses TI.
+ */
+static inline void enable_mmu(void)
+{
+	unsigned int cpu = smp_processor_id();
+
+	/* Enable MMU + flush TLB (AT=1 | TI=1) */
+	__raw_writel(MMUCR_AT | MMUCR_TI, MMUCR);
+	ctrl_barrier();
+
+	if (asid_cache(cpu) == NO_CONTEXT)
+		asid_cache(cpu) = MMU_CONTEXT_FIRST_VERSION;
+
+	set_asid(asid_cache(cpu) & MMU_CONTEXT_ASID_MASK);
+}
+
+static inline void disable_mmu(void)
+{
+	/* Disable MMU, flush TLB (AT=0, TI=1) */
+	__raw_writel(MMUCR_TI, MMUCR);
+	ctrl_barrier();
+}
+#else
 static inline void enable_mmu(void)
 {
 	unsigned int cpu = smp_processor_id();
@@ -166,6 +196,7 @@ static inline void disable_mmu(void)
 
 	ctrl_barrier();
 }
+#endif
 #else
 /*
  * MMU control handlers for processors lacking memory

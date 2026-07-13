@@ -139,6 +139,7 @@ machdir-y					+= mach-common
 # As an example, in order of preference, SH-2A > SH-2 > common definitions.
 #
 cpuincdir-$(CONFIG_CPU_SH2A)	+= cpu-sh2a
+cpuincdir-$(CONFIG_CPU_JCORE)	+= cpu-jcore
 cpuincdir-$(CONFIG_CPU_SH2)	+= cpu-sh2
 cpuincdir-$(CONFIG_CPU_SH3)	+= cpu-sh3
 cpuincdir-$(CONFIG_CPU_SH4A)	+= cpu-sh4a
