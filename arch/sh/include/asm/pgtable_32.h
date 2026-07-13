@@ -2,6 +2,10 @@
 #ifndef __ASM_SH_PGTABLE_32_H
 #define __ASM_SH_PGTABLE_32_H
 
+#ifdef CONFIG_CPU_JCORE
+#include <asm/pgtable-bits-jcore.h>
+#endif
+
 /*
  * Linux PTEL encoding.
  *
@@ -38,7 +42,10 @@
  * PTE encoding, so a 64-bit pte_t is necessary for these parts. On the plus
  * side, this gives us quite a few spare bits to play with for future usage.
  */
-/* Legacy and compat mode bits */
+/* Legacy and compat mode bits.
+ * Not used for CONFIG_CPU_JCORE: the jcore _PAGE_* bit layout and hw
+ * PTEL conversion live in asm/pgtable-bits-jcore.h (included above). */
+#ifndef CONFIG_CPU_JCORE
 #define	_PAGE_WT	0x001		/* WT-bit on SH-4, 0 on SH-3 */
 #define _PAGE_HW_SHARED	0x002		/* SH-bit  : shared among processes */
 #define _PAGE_DIRTY	0x004		/* D-bit   : page changed */
@@ -54,6 +61,7 @@
 
 #define _PAGE_SZ_MASK	(_PAGE_SZ0 | _PAGE_SZ1)
 #define _PAGE_PR_MASK	(_PAGE_RW | _PAGE_USER)
+#endif /* !CONFIG_CPU_JCORE */
 
 /* Extended mode bits */
 #define _PAGE_EXT_ESZ0		0x0010	/* ESZ0-bit: Size of page */
@@ -101,7 +109,11 @@ static inline unsigned long copy_ptea_attributes(unsigned long x)
 #endif
 
 /* Mask which drops unused bits from the PTEL value */
-#if defined(CONFIG_CPU_SH3)
+#if defined(CONFIG_CPU_JCORE)
+/* jcore_pte_to_ptel() does the real pte->PTEL conversion; this mask only
+ * needs to drop the software-only bits that never reach hardware. */
+#define _PAGE_CLEAR_FLAGS	(_PAGE_PROTNONE | _PAGE_ACCESSED | _PAGE_SPECIAL)
+#elif defined(CONFIG_CPU_SH3)
 #define _PAGE_CLEAR_FLAGS	(_PAGE_PROTNONE | _PAGE_ACCESSED| \
 				  _PAGE_SZ1	| _PAGE_HW_SHARED)
 #elif defined(CONFIG_X2TLB)
@@ -115,7 +127,11 @@ static inline unsigned long copy_ptea_attributes(unsigned long x)
 #define _PAGE_FLAGS_HARDWARE_MASK	(phys_addr_mask() & ~(_PAGE_CLEAR_FLAGS))
 
 /* Hardware flags, page size encoding */
-#if !defined(CONFIG_MMU)
+#if defined(CONFIG_CPU_JCORE)
+/* Page size (16 KB, PageMask field) is fixed and encoded directly by
+ * jcore_pte_to_ptel(), not via extra pte bits composed into pgprot. */
+# define _PAGE_FLAGS_HARD	0
+#elif !defined(CONFIG_MMU)
 # define _PAGE_FLAGS_HARD	0ULL
 #elif defined(CONFIG_X2TLB)
 # if defined(CONFIG_PAGE_SIZE_4KB)

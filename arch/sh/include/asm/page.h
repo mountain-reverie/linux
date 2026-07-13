@@ -12,6 +12,12 @@
 
 #define PTE_MASK	PAGE_MASK
 
+#ifdef CONFIG_PAGE_SIZE_16KB
+/* jcore (J4) MMU: fixed 16 KB pages. PAGE_SHIFT/PAGE_SIZE/PAGE_MASK
+ * themselves come from <vdso/page.h> (CONFIG_PAGE_SHIFT), this just
+ * documents that CONFIG_PAGE_SIZE_16KB is reachable/expected here. */
+#endif
+
 #if defined(CONFIG_HUGETLB_PAGE_SIZE_64K)
 #define HPAGE_SHIFT	16
 #elif defined(CONFIG_HUGETLB_PAGE_SIZE_256K)

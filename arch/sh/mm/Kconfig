@@ -6,6 +6,7 @@ config MMU
 	depends on !CPU_SH2 || CPU_JCORE
 	select HAVE_PAGE_SIZE_4KB
 	select HAVE_PAGE_SIZE_8KB if X2TLB
+	select HAVE_PAGE_SIZE_16KB if CPU_JCORE
 	select HAVE_PAGE_SIZE_64KB if CPU_SH4
 	default y
 	help
