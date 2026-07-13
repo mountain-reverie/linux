@@ -1301,6 +1301,7 @@ config HAVE_PAGE_SIZE_256KB
 
 choice
 	prompt "MMU page size"
+	default PAGE_SIZE_16KB if CPU_JCORE
 
 config PAGE_SIZE_4KB
 	bool "4KiB pages"
