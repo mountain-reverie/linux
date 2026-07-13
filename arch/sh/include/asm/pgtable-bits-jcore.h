@@ -18,15 +18,16 @@
  * Linux pte_t (pte_low, 32-bit) layout chosen for jcore:
  *
  *   bit:  31........14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
- *         |   PFN     |--- soft ---|PN|AC|WR|EX|US|DI|CA|GL|ST|VA|
+ *         |   PFN     |-r-|SP|-r-|PN|AC|WR|EX|US|DI|CA|GL|ST|VA|
  *
  *   31:14  PFN            physical page number (PA[31:14]), same
  *                         convention as the rest of arch/sh (pfn_pte()
  *                         shifts the pfn left by PAGE_SHIFT and ORs in
  *                         pgprot_val()).
- *   11:13  reserved       spare software bits (swap-entry type/offset
+ *   12:13  reserved       spare software bits (swap-entry type/offset
  *                         extension, currently unused)
- *   10     _PAGE_SPECIAL  software only
+ *   11     _PAGE_SPECIAL  software only (0x800, NOT bit 10)
+ *   10     reserved       spare software bit (currently unused)
  *    9     _PAGE_PROTNONE software only (vma protection None)
  *    8     _PAGE_ACCESSED software only (referenced)
  *    7     _PAGE_WRITE    hw: PTEL.W  (bit 7)
@@ -77,6 +78,22 @@
 #define _PAGE_RW	_PAGE_WRITE
 #define _PAGE_CACHABLE	_PAGE_CACHEABLE
 #define _PAGE_HW_SHARED	_PAGE_GLOBAL
+
+/*
+ * Non-X2TLB swap-pte encoding (see arch/sh/include/asm/pgtable_32.h):
+ * __swp_entry_to_pte() does `pte_low = swp.val << 1`, where swp.val packs
+ * `type` in bits 0..4 and `offset` in bits 10..31. After the <<1 shift,
+ * pte_low bits 1..5 hold `type` and pte_low bits 11..31 hold `offset`;
+ * pte_low bits 6..9 are always zero. The generic code stashes the swap
+ * exclusive-marker in _PAGE_USER (bit 6 on stock SH, safely inside that
+ * free zone). jcore's _PAGE_USER is bit 5 instead, which collides with
+ * `type`'s MSB -- reusing it would silently corrupt swap type >= 16 (and
+ * any offset bit 0, since offset starts at bit 10 anyway) whenever a page
+ * is marked/cleared exclusive. Override to _PAGE_EXEC (bit 6), which is
+ * still inside the pte_low bits 6..9 free zone and carries no meaning on a
+ * non-present (swap) pte.
+ */
+#define _PAGE_SWP_EXCLUSIVE	_PAGE_EXEC
 
 /* PTEL PageMask[11:8] field value for 16 KB pages. */
 #define _PAGE_JCORE_PAGEMASK_16KB	0x1UL

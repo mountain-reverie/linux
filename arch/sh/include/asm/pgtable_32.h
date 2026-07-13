@@ -483,8 +483,29 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
 #define __swp_entry_to_pte(x)		((pte_t) { (x).val << 1 })
 #endif
 
-/* In both cases, we borrow bit 6 to store the exclusive marker in swap PTEs. */
+/*
+ * In both cases, we borrow a hw-position bit to store the exclusive marker
+ * in swap PTEs. Generically this is _PAGE_USER (bit 6 on stock SH). jcore is
+ * always non-X2TLB, so only that encoding matters here: __swp_entry_to_pte()
+ * does `pte_low = swp.val << 1`, and swp.val packs `type` in bits 0..4 and
+ * `offset` in bits 10..31 (see the format diagram above). After the <<1,
+ * pte_low bits 1..5 hold `type` (5 bits) and pte_low bits 11..31 hold
+ * `offset`; pte_low bits 6..9 are always zero -- unused by either field.
+ * Stock SH's _PAGE_USER (bit 6) sits in that free zone, hence the generic
+ * choice below is safe there.
+ *
+ * CONFIG_CPU_JCORE moves _PAGE_USER down to bit 5, which IS inside the
+ * `type` field (pte_low bit 5 = type's MSB) -- reusing it here would corrupt
+ * swap type >= 16 whenever the exclusive marker is set/cleared (silent data
+ * corruption on swap-in). jcore therefore overrides _PAGE_SWP_EXCLUSIVE
+ * (pgtable-bits-jcore.h, included above) to _PAGE_EXEC (bit 6), which is
+ * still in the pte_low bits 6..9 free zone and is never used by swap ptes
+ * (a swap pte has _PAGE_PRESENT/_PAGE_VALID clear, so its _PAGE_EXEC bit
+ * carries no present-pte meaning).
+ */
+#ifndef _PAGE_SWP_EXCLUSIVE
 #define _PAGE_SWP_EXCLUSIVE	_PAGE_USER
+#endif
 
 static inline bool pte_swp_exclusive(pte_t pte)
 {
