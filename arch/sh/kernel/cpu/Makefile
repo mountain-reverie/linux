@@ -13,6 +13,10 @@ obj-$(CONFIG_CPU_SH4)		= sh4/
 obj-$(CONFIG_CPU_SH4A)		+= sh4a/
 obj-$(CONFIG_ARCH_SHMOBILE)	+= shmobile/
 
+# J-Core J4 adds its own fixed TLB-miss vectors/handler on top of the
+# CPU_SH2 base it selects (Kconfig CPU_JCORE), rather than replacing it.
+obj-$(CONFIG_CPU_JCORE)	+= jcore/
+
 # Common interfaces.
 
 obj-$(CONFIG_SH_ADC)		+= adc.o

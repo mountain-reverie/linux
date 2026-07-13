@@ -31,6 +31,7 @@ debugfs-$(CONFIG_CPU_SH4)	+= tlb-debugfs.o
 tlb-$(CONFIG_CPU_SH3)		:= tlb-sh3.o
 tlb-$(CONFIG_CPU_SH4)		:= tlb-sh4.o tlb-urb.o
 tlb-$(CONFIG_CPU_HAS_PTEAEX)	:= tlb-pteaex.o tlb-urb.o
+tlb-$(CONFIG_CPU_JCORE)		:= tlb-jcore.o
 obj-y				+= $(tlb-y)
 endif
 

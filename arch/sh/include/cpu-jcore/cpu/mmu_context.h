@@ -24,6 +24,12 @@
 
 #define MMU_CONTROL_INIT	(MMUCR_AT | MMUCR_TI)
 
+/* J4's TLB is a 32-entry, fully-associative, software-loaded array
+ * (docs/architecture/tlb.md). generic sh mm code (tlbflush_32.c) uses
+ * this only as a coarse flush-all-vs-per-page threshold, not a
+ * hardware-precise figure. */
+#define MMU_NTLB_ENTRIES	32
+
 #define TRA	0xff000020
 #define EXPEVT	0xff000024
 #define INTEVT	0xff000028
