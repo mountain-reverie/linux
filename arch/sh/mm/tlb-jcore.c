@@ -20,6 +20,7 @@
 
 #include <asm/pgtable.h>
 #include <asm/mmu_context.h>
+#include <asm/tlb-jcore.h>
 #include <cpu/mmu_context.h>
 
 /*
