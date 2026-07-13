@@ -735,7 +735,18 @@ asmlinkage void do_exception_error(void)
 
 void per_cpu_trap_init(void)
 {
+#ifdef CONFIG_CPU_JCORE
+	/*
+	 * J4 has hardware-fixed TLB-miss vectors at VBR+0x400/0x420/0x440
+	 * (see arch/sh/kernel/cpu/jcore/ex.S); point VBR at jcore_vbr_base,
+	 * not the generic sh2/ex.S vbr_base, so those literal offsets
+	 * actually contain the TLB-miss stubs.
+	 */
+	extern void *jcore_vbr_base;
+#define vbr_base jcore_vbr_base
+#else
 	extern void *vbr_base;
+#endif
 
 	/* NOTE: The VBR value should be at P1
 	   (or P2, virtural "fixed" address space).
@@ -745,6 +756,9 @@ void per_cpu_trap_init(void)
 		     : /* no output */
 		     : "r" (&vbr_base)
 		     : "memory");
+#ifdef CONFIG_CPU_JCORE
+#undef vbr_base
+#endif
 
 	/* disable exception blocking now when the vbr has been setup */
 	clear_bl_bit();

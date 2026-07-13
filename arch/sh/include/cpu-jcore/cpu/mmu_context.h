@@ -34,4 +34,15 @@
 #define EXPEVT	0xff000024
 #define INTEVT	0xff000028
 
+/*
+ * Boot TSB sizing (hardware-spec.md §2.6: TSB_SIZE_LOG valid range is
+ * 6-14, each entry is 16 bytes). SP1 boot needs only a small early TSB
+ * to get translation on; SP2/SP3 per-CPU TSBs (linux-spec.md §6.2) are
+ * sized/allocated separately at CPU-up time. 256 entries (log2=8) is
+ * 4096 bytes -- one 16KB page's worth of PTEs' hash spread, plenty for
+ * the boot CPU's early miss traffic before proper per-mm TSBs exist.
+ */
+#define JCORE_BOOT_TSB_SIZE_LOG	8
+#define JCORE_BOOT_TSB_BYTES	(16 << JCORE_BOOT_TSB_SIZE_LOG)
+
 #endif /* __ASM_CPU_JCORE_MMU_CONTEXT_H */

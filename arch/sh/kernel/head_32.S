@@ -291,6 +291,65 @@ ENTRY(_stext)
 .Lpmb_done:
 #endif /* CONFIG_PMB */
 
+#ifdef CONFIG_CPU_JCORE
+/*
+ * J-Core J4 boot MMU-enable.
+ *
+ * Unlike the SH-4A PMB path above (mutually exclusive with this arm --
+ * CPU_SUBTYPE_JCORE does not select CONFIG_PMB), J4 has no page-mapping
+ * buffer to reprogram. Boot runs here in P1 (untranslated, cached),
+ * which -- per hardware-spec.md §2.3 ("P1, P2, P4 unaffected") -- is
+ * unaffected by MMUCR.AT either way, so plain P1 loads/stores to the
+ * boot TSB below are safe both before and after we flip AT.
+ *
+ * Sequence (linux-spec.md §11, hardware-spec.md §2.6/§2.7/§2.3):
+ *   1. Program TSBBR (TSB base [31:N+4] | TSB_SIZE_LOG [3:0]) to point
+ *      at the BSS-resident boot TSB (jcore_boot_tsb, probe.c), which is
+ *      aligned to its own size so the physical address's low bits are
+ *      already zero and TSB_SIZE_LOG can just be OR'd in.
+ *   2. Program TSBCFG (HASH_MODE=1, HASH_SHIFT=TSB_SIZE_LOG) so
+ *      hardware's XOR-fold hash is well spread from the very first
+ *      TLB miss.
+ *   3. ASIDR = 0 (kernel ASID_TAG), PTEH = 0 (no faulting VPN yet).
+ *   4. MMUCR = AT=1 | TI=1 in one write: enables translation and
+ *      flushes any stale TLB content left over from a warm reset, in
+ *      the same atomic MMIO write (mirrors enable_mmu(),
+ *      asm/mmu_context.h).
+ *
+ * P0/P3 accesses are translated from this point on; the boot TSB and
+ * this code itself stay reachable throughout because they are P1.
+ */
+	mov.l	.LJCORE_TSB_PHYS, r0
+	or	#JCORE_BOOT_TSB_SIZE_LOG, r0
+	mov.l	.LJCORE_TSBBR, r1
+	mov.l	r0, @r1
+
+	mov	#JCORE_BOOT_TSB_SIZE_LOG, r0
+	shll2	r0
+	or	#1, r0			! HASH_MODE=1 (XOR fold)
+	mov.l	.LJCORE_TSBCFG, r1
+	mov.l	r0, @r1
+
+	mov	#0, r0
+	ldc	r0, asidr		! ASIDR = 0 (kernel ASID_TAG)
+	ldc	r0, pteh		! PTEH = 0 (no faulting VPN yet)
+
+	mov.l	.LJCORE_MMUCR_INIT, r0
+	mov.l	.LJCORE_MMUCR, r1
+	mov.l	r0, @r1			! AT=1 | TI=1 (enable + flush, atomic)
+
+	bra	.Ljcore_mmu_done
+	 nop
+
+	.balign 4
+.LJCORE_TSBBR:		.long	TSBBR
+.LJCORE_TSBCFG:		.long	TSBCFG
+.LJCORE_MMUCR:		.long	MMUCR
+.LJCORE_MMUCR_INIT:	.long	(MMUCR_AT | MMUCR_TI)
+.LJCORE_TSB_PHYS:	.long	jcore_boot_tsb - PAGE_OFFSET + __MEMORY_START
+.Ljcore_mmu_done:
+#endif /* CONFIG_CPU_JCORE */
+
 #ifndef CONFIG_SH_NO_BSS_INIT
 	/*
 	 * Don't clear BSS if running on slow platforms such as an RTL simulation,

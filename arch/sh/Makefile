@@ -78,6 +78,17 @@ cflags-$(CONFIG_CPU_LITTLE_ENDIAN)	+= -ml
 cflags-y	+= $(call cc-option,-mno-fdpic)
 cflags-y	+= $(isaflags-y) -ffreestanding
 
+# J-Core (CPU_JCORE) is built with a bare "sh2-elf-" gcc, which by default
+# prefixes every C symbol with a leading underscore (newlib/bare-metal ABI
+# convention). Mainline SH Linux's hand-written assembly (arch/sh/lib/*.S
+# libgcc-replacement stubs like __ashlsi3_r0, plus the jiffies --defsym
+# trick below) all assume the unprefixed sh*-linux-gnu convention; with the
+# default prefixing, gcc-generated libcalls resolve to e.g.
+# "___ashlsi3_r0" while the hand-written .S label is "__ashlsi3_r0",
+# an undefined-reference mismatch at link time. -fno-leading-underscore
+# restores the unprefixed convention the rest of the tree assumes.
+cflags-$(CONFIG_CPU_JCORE)	+= $(call cc-option,-fno-leading-underscore,)
+
 OBJCOPYFLAGS	:= -O binary -R .note -R .note.gnu.build-id -R .comment \
 		   -R .stab -R .stabstr -S
 
@@ -104,6 +115,25 @@ KBUILD_IMAGE		:= $(boot)/$(defaultimage-y)
 UTS_MACHINE		:= sh
 LDFLAGS_vmlinux		+= -e _stext
 
+# J-Core (CPU_JCORE) is built with a bare "sh2-elf-" binutils, not a
+# sh*-linux-gnu one, so the glibc-tagged "-linux" BFD output targets
+# (elf32-sh-linux / elf32-shbig-linux) aren't configured into ld. The
+# kernel is a statically-linked monolithic image, so the plain
+# elf32-sh(l) targets (no OS-ABI tag) work identically for our purposes.
+ifdef CONFIG_CPU_JCORE
+# -fno-leading-underscore (above) makes the J-Core sh2-elf-gcc use the
+# same unprefixed C symbol convention as sh*-linux-gnu, so the plain
+# --defsym below (no underscore) applies here too.
+ifdef CONFIG_CPU_LITTLE_ENDIAN
+ld_bfd			:= elf32-shl
+LDFLAGS_vmlinux		+= --defsym jiffies=jiffies_64 --oformat $(ld_bfd)
+KBUILD_LDFLAGS		+= -EL
+else
+ld_bfd			:= elf32-sh
+LDFLAGS_vmlinux		+= --defsym jiffies=jiffies_64+4 --oformat $(ld_bfd)
+KBUILD_LDFLAGS		+= -EB
+endif
+else
 ifdef CONFIG_CPU_LITTLE_ENDIAN
 ld_bfd			:= elf32-sh-linux
 LDFLAGS_vmlinux		+= --defsym jiffies=jiffies_64 --oformat $(ld_bfd)
@@ -112,6 +142,7 @@ else
 ld_bfd			:= elf32-shbig-linux
 LDFLAGS_vmlinux		+= --defsym jiffies=jiffies_64+4 --oformat $(ld_bfd)
 KBUILD_LDFLAGS		+= -EB
+endif
 endif
 
 export ld_bfd
