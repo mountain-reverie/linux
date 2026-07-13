@@ -27,7 +27,7 @@ isa-$(CONFIG_CPU_SH4A)			:= sh4a
 isa-$(CONFIG_CPU_SH4AL_DSP)		:= sh4al
 
 isa-$(CONFIG_SH_DSP)			:= $(isa-y)-dsp
-isa-$(CONFIG_CPU_SUBTYPE_JCORE)	:= sh2
+isa-$(CONFIG_CPU_SUBTYPE_JCORE)	:= sh-jcore
 isa-y					:= $(isa-y)-up
 
 cflags-$(CONFIG_CPU_SH2)		:= $(call cc-option,-m2,)

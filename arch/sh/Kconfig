@@ -239,6 +239,12 @@ config CPU_SUBTYPE_JCORE
 	bool "Support J-Core J4 (MMU) processor"
 	select CPU_JCORE
 	select MMU
+	select SYS_SUPPORTS_SMP
+	select GENERIC_CLOCKEVENTS_BROADCAST if SMP
+	help
+	  Select J-Core J4 if running on the J-Core processor with MMU support.
+	  The J4 is a SH-2-compatible CPU core designed for embedded systems,
+	  featuring a memory management unit (MMU) for advanced OS support.
 
 # SH-2A Processor Support
 
