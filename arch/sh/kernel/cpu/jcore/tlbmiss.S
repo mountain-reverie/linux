@@ -40,11 +40,16 @@ ENTRY(jcore_tlb_miss)
 	cmp/eq	r1, r2			! VPN match?
 	bf	jcore_tlb_miss_slow
 	mov.l	@r0+, r1		! r1 = tag_lo (expected ASID_TAG); r0 += 4
+	mov.l	@r0, r3			! r3 = TTE data (PTEL image) -- loaded here,
+					! not after the check, so its load-use
+					! latency hides behind the ASID stc/cmp/bf
+					! below and 'ldc r3,ptel' never stalls on the
+					! hit path. Harmless on a miss (r3 is bank-1
+					! scratch; the slow path re-derives everything).
 	stc	asidr, r2		! r2 = current ASID_TAG
 	cmp/eq	r1, r2			! ASID_TAG match?
 	bf	jcore_tlb_miss_slow
-	mov.l	@r0, r3			! r3 = TTE data (PTEL image)
-	ldc	r3, ptel
+	ldc	r3, ptel		! r3 ready (loaded 3 insns ago; no stall)
 	ldtlb.rn			! install TLB entry + return (no delay slot)
 	! NOT REACHED: LDTLB.RN returns directly to the faulting instruction.
 
