@@ -103,6 +103,7 @@
 #define _PAGE_JCORE_PPN_SHIFT		10
 #define _PAGE_JCORE_PAGEMASK_SHIFT	8
 
+#ifndef __ASSEMBLY__
 /*
  * jcore_pte_to_ptel() - convert a Linux pte_t value into the hardware
  * PTEL image the J4 MMU TLB-fill/walker expects.
@@ -112,6 +113,12 @@
  *
  * Hardware PTEL image: PPN[31:10] | PageMask[11:8] | W7 X6 U5 D4 C3 G2
  * STALE1 V0.
+ *
+ * Guarded by __ASSEMBLY__ (not defined by the kernel proper, but passed
+ * explicitly by bare-metal .S harnesses -- e.g. jcore-cpu's SP2
+ * sim/tests/mmulinux.S -- that #include this header purely for the
+ * _PAGE_* bit values) so the function body, which is not valid gas input,
+ * does not get pulled into an assembly file.
  */
 static inline unsigned long jcore_pte_to_ptel(unsigned long pte_val)
 {
@@ -121,5 +128,6 @@ static inline unsigned long jcore_pte_to_ptel(unsigned long pte_val)
 
 	return ppn | pagemask | hwbits;
 }
+#endif /* !__ASSEMBLY__ */
 
 #endif /* __ASM_SH_PGTABLE_BITS_JCORE_H */
