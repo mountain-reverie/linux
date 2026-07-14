@@ -104,7 +104,7 @@ ENTRY(jcore_tlb_fault_entry)
 
 	mov	r15, r4			! arg0: regs
 	mov	#0, r5			! arg1: error_code (not yet threaded
-					!  through from tlbmiss.S; TODO Task 5)
+					!  through from tlbmiss.S; TODO(SP3): pass real fault error_code once the runtime fault path is exercised; harmless while SP1 is build/link-only)
 	mov.l	1f, r6
 	mov.l	@r6, r6			! arg2: faulting address (MMU_TEA)
 
