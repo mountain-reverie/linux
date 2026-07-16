@@ -115,21 +115,16 @@ KBUILD_IMAGE		:= $(boot)/$(defaultimage-y)
 UTS_MACHINE		:= sh
 LDFLAGS_vmlinux		+= -e _stext
 
-# J-Core (CPU_JCORE) is built with a bare "sh2-elf-" binutils, not a
-# sh*-linux-gnu one, so the glibc-tagged "-linux" BFD output targets
-# (elf32-sh-linux / elf32-shbig-linux) aren't configured into ld. The
-# kernel is a statically-linked monolithic image, so the plain
-# elf32-sh(l) targets (no OS-ABI tag) work identically for our purposes.
+# J-Core (CPU_JCORE) MMU build: use standard linux-gnu toolchain targets.
+# (The comment below about bare sh2-elf was historical; actual builds now
+# use sh2eb-linux-muslfdpic- with elf32-sh-linux/elf32-shbig-linux targets.)
 ifdef CONFIG_CPU_JCORE
-# -fno-leading-underscore (above) makes the J-Core sh2-elf-gcc use the
-# same unprefixed C symbol convention as sh*-linux-gnu, so the plain
-# --defsym below (no underscore) applies here too.
 ifdef CONFIG_CPU_LITTLE_ENDIAN
-ld_bfd			:= elf32-shl
+ld_bfd			:= elf32-sh-linux
 LDFLAGS_vmlinux		+= --defsym jiffies=jiffies_64 --oformat $(ld_bfd)
 KBUILD_LDFLAGS		+= -EL
 else
-ld_bfd			:= elf32-sh
+ld_bfd			:= elf32-shbig-linux
 LDFLAGS_vmlinux		+= --defsym jiffies=jiffies_64+4 --oformat $(ld_bfd)
 KBUILD_LDFLAGS		+= -EB
 endif
