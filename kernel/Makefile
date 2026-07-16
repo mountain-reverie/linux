@@ -25,6 +25,16 @@ ifdef CONFIG_TRACE_BRANCH_PROFILING
 CFLAGS_context_tracking.o += -DDISABLE_BRANCH_PROFILING
 endif
 
+# J-core / SH-2: gcc's SH backend ICEs building nstree.c (the listns syscall with
+# scope-based __free cleanup) -- "internal compiler error: in change_address_1, at
+# emit-rtl.cc" -- on every released gcc and trunk, triggered by inlining. Disable
+# ordinary inlining for this one file to dodge it; -O2 (and thus dead-code
+# elimination of __cmpxchg_called_with_bad_pointer) and __always_inline are kept,
+# so codegen is otherwise unaffected. Remove once the gcc SH backend is fixed.
+ifdef CONFIG_CPU_SH2
+CFLAGS_nstree.o += -fno-inline
+endif
+
 # Prevents flicker of uninteresting __do_softirq()/__local_bh_disable_ip()
 # in coverage traces.
 KCOV_INSTRUMENT_softirq.o := n
