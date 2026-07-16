@@ -3,4 +3,4 @@
 # Makefile for the Linux/SuperH J-Core J4 CPU-specific backend.
 #
 
-obj-y	:= ex.o entry.o probe.o setup.o
+obj-y	:= ex.o entry.o probe.o setup.o mmu_enable.o

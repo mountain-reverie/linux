@@ -318,34 +318,23 @@ ENTRY(_stext)
  *
  * P0/P3 accesses are translated from this point on; the boot TSB and
  * this code itself stay reachable throughout because they are P1.
+ *
+ * The actual TSBBR/TSBCFG/ASIDR/PTEH/MMUCR programming sequence lives
+ * in jcore_mmu_enable() (arch/sh/kernel/cpu/jcore/mmu_enable.S) so that
+ * the real boot path and the SP3 cosim harness share byte-identical
+ * code. We only compute the boot-TSB physical address here (it needs
+ * PAGE_OFFSET/__MEMORY_START relocation, which a cosim harness doesn't
+ * have) and pass it in r4 per jcore_mmu_enable's input contract.
  */
-	mov.l	.LJCORE_TSB_PHYS, r0
-	or	#JCORE_BOOT_TSB_SIZE_LOG, r0
-	mov.l	.LJCORE_TSBBR, r1
-	mov.l	r0, @r1
-
-	mov	#JCORE_BOOT_TSB_SIZE_LOG, r0
-	shll2	r0
-	or	#1, r0			! HASH_MODE=1 (XOR fold)
-	mov.l	.LJCORE_TSBCFG, r1
-	mov.l	r0, @r1
-
-	mov	#0, r0
-	ldc	r0, asidr		! ASIDR = 0 (kernel ASID_TAG)
-	ldc	r0, pteh		! PTEH = 0 (no faulting VPN yet)
-
-	mov.l	.LJCORE_MMUCR_INIT, r0
-	mov.l	.LJCORE_MMUCR, r1
-	mov.l	r0, @r1			! AT=1 | TI=1 (enable + flush, atomic)
-
+	mov.l	.LJCORE_TSB_PHYS, r4
+	mov.l	.LJCORE_MMU_ENABLE, r0
+	jsr	@r0
+	 nop
 	bra	.Ljcore_mmu_done
 	 nop
 
 	.balign 4
-.LJCORE_TSBBR:		.long	TSBBR
-.LJCORE_TSBCFG:		.long	TSBCFG
-.LJCORE_MMUCR:		.long	MMUCR
-.LJCORE_MMUCR_INIT:	.long	(MMUCR_AT | MMUCR_TI)
+.LJCORE_MMU_ENABLE:	.long	jcore_mmu_enable
 .LJCORE_TSB_PHYS:	.long	jcore_boot_tsb - PAGE_OFFSET + __MEMORY_START
 .Ljcore_mmu_done:
 #endif /* CONFIG_CPU_JCORE */
