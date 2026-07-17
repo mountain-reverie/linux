@@ -36,26 +36,37 @@ static inline bool jcore_asid_gen_wrapped(unsigned long ctx)
 static inline void set_asid(unsigned long asid)
 {
 	/*
-	 * TODO(SP2/SP3): generation is hardcoded 0 here — the ASID_TAG gen_low
-	 * nibble is not yet live. Threading the real generation into the tag must
-	 * land together with ASID rollover + TSB rebuild-on-wrap (the consumer),
-	 * per hardware-spec §2.1a and security-review S-I3. Until then stale-TSB
-	 * rejection relies on TLB flush only. Do NOT treat ASID as fully generation-
-	 * tagged until this is done.
+	 * Thread the current TLB generation (version nibble of the running
+	 * context) into ASID_TAG[15:12]. asid_cache(cpu) holds the full
+	 * cpu_context (asid | version<<12) for the CPU we are switching on:
+	 * activate_context()/switch_mm() set it (via get_mmu_context) before
+	 * calling set_asid. The generation-tagged tag lets recycled 12-bit
+	 * ASIDs coexist in the global TSB for 16 generations without false
+	 * hits; jcore_tsb_flush_on_generation() rebuilds the TSB on wrap
+	 * (security-review S-I3, hardware-spec §2.1a).
 	 */
-	unsigned long tag = jcore_encode_asid_tag(asid, 0);
+	unsigned long gen = asid_cache(raw_smp_processor_id());
+	unsigned long tag = jcore_encode_asid_tag(asid, gen);
 
-	__asm__ __volatile__ ("ldc %0, asidr"
-			      : : "r" (tag));
+	__asm__ __volatile__ ("ldc %0, asidr" : : "r" (tag));
 }
 
 static inline unsigned long get_asid(void)
 {
-	unsigned long asid;
+	unsigned long tag;
 
-	__asm__ __volatile__ ("stc asidr, %0"
-			      : "=r" (asid));
-	return asid & MMU_CONTEXT_ASID_MASK;
+	__asm__ __volatile__ ("stc asidr, %0" : "=r" (tag));
+	/*
+	 * Return the full 16-bit ASID_TAG (asid | gen_low<<12), not just the
+	 * 12-bit ASID: tlbflush_32.c saves this and restores it verbatim via
+	 * set_asid(), so gen_low must survive the round-trip.
+	 *
+	 * MMU_NO_ASID (0x1000, i.e. asid=0/gen_low=1) sentinel invariant: every
+	 * saved_asid = get_asid() site in tlbflush_32.c runs only while a user
+	 * mm is the live context (asid != 0), so a full tag of exactly 0x1000
+	 * can never be captured as saved_asid there (see tlbflush_32.c).
+	 */
+	return tag & 0xffff;
 }
 
 /*
