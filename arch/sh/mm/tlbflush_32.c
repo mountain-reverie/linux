@@ -12,6 +12,16 @@
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 
+/*
+ * Generic no-op default: only jcore has a software TSB that can alias
+ * across a reused ASID generation nibble (security-review S-I3). jcore
+ * overrides this in arch/sh/mm/tlb-jcore.c (CONFIG_CPU_JCORE only); every
+ * other 32-bit SH MMU build links this weak default instead.
+ */
+void __weak jcore_tsb_flush_on_generation(unsigned long new_ctx)
+{
+}
+
 void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
 {
 	unsigned int cpu = smp_processor_id();

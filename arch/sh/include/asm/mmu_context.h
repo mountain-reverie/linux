@@ -73,6 +73,15 @@
 #include <asm/mmu_context_32.h>
 
 /*
+ * jcore_tsb_flush_on_generation() - zero any software TSB whose stale
+ * entries could alias against a reused ASID generation nibble
+ * (security-review S-I3). Generic no-op default lives in
+ * arch/sh/mm/tlbflush_32.c (linked into every 32-bit SH MMU build);
+ * jcore overrides it in arch/sh/mm/tlb-jcore.c (CONFIG_CPU_JCORE only).
+ */
+extern void jcore_tsb_flush_on_generation(unsigned long new_ctx);
+
+/*
  * Get MMU context if needed.
  */
 static inline void get_mmu_context(struct mm_struct *mm, unsigned int cpu)
@@ -89,8 +98,25 @@ static inline void get_mmu_context(struct mm_struct *mm, unsigned int cpu)
 		/*
 		 * We exhaust ASID of this version.
 		 * Flush all TLB and start new cycle.
+		 *
+		 * NOTE (jcore, SMP scope): this is local_flush_tlb_all(),
+		 * deliberately NOT the SMP-broadcast flush_tlb_all() --
+		 * each CPU wraps its own per-CPU asid_cache independently
+		 * and only needs to invalidate its own TLB. jcore SMP
+		 * bring-up (SP2/SP3, see arch/sh/kernel/cpu/jcore/probe.c)
+		 * has not wired a cross-CPU broadcast for this path, so
+		 * jcore_tsb_flush_on_generation() below matches the SAME
+		 * local-only discipline rather than inventing a new
+		 * broadcast/IPI mechanism. On single-core this is exact.
+		 * If/when jcore SMP lands with multiple CPUs concurrently
+		 * walking the shared boot TSB, a wrap on one CPU racing a
+		 * memset() with another CPU's in-flight TSB read/insert
+		 * is a known hazard to revisit at that point (it would
+		 * need the same broadcast point flush_tlb_all() gets, not
+		 * an ad hoc IPI here).
 		 */
 		local_flush_tlb_all();
+		jcore_tsb_flush_on_generation(asid);
 
 		/*
 		 * Fix version; Note that we avoid version #0
