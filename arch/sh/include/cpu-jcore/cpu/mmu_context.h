@@ -45,4 +45,10 @@
 #define JCORE_BOOT_TSB_SIZE_LOG	8
 #define JCORE_BOOT_TSB_BYTES	(16 << JCORE_BOOT_TSB_SIZE_LOG)
 
+#ifndef __ASSEMBLY__
+/* Defined in arch/sh/kernel/cpu/jcore/probe.c; consumed by tlb-jcore.c to
+ * zero the boot TSB on ASID generation wrap (security-review S-I3). */
+extern char jcore_boot_tsb[JCORE_BOOT_TSB_BYTES];
+#endif /* __ASSEMBLY__ */
+
 #endif /* __ASM_CPU_JCORE_MMU_CONTEXT_H */

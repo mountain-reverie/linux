@@ -23,29 +23,63 @@ static inline u16 jcore_encode_asid_tag(u16 asid, u64 gen)
 			<< JCORE_ASID_GEN_SHIFT);
 }
 
+/*
+ * True iff version bump lands gen_low back on 0 (every 16th rollover) --
+ * point where gen_low nibble is about to be reused. Triggers TSB rebuild
+ * to reject stale entries per security-review S-I3.
+ */
+static inline bool jcore_asid_gen_wrapped(unsigned long ctx)
+{
+	return (((ctx >> JCORE_ASID_GEN_SHIFT) & JCORE_ASID_GEN_MASK) == 0);
+}
+
 static inline void set_asid(unsigned long asid)
 {
 	/*
-	 * TODO(SP2/SP3): generation is hardcoded 0 here — the ASID_TAG gen_low
-	 * nibble is not yet live. Threading the real generation into the tag must
-	 * land together with ASID rollover + TSB rebuild-on-wrap (the consumer),
-	 * per hardware-spec §2.1a and security-review S-I3. Until then stale-TSB
-	 * rejection relies on TLB flush only. Do NOT treat ASID as fully generation-
-	 * tagged until this is done.
+	 * Thread the current TLB generation (version nibble of the running
+	 * context) into ASID_TAG[15:12]. asid_cache(cpu) holds the full
+	 * cpu_context (asid | version<<12) for the CPU we are switching on:
+	 * activate_context()/switch_mm() set it (via get_mmu_context) before
+	 * calling set_asid. The generation-tagged tag lets recycled 12-bit
+	 * ASIDs coexist in the global TSB for 16 generations without false
+	 * hits; jcore_tsb_flush_on_generation() rebuilds the TSB on wrap
+	 * (security-review S-I3, hardware-spec §2.1a).
+	 *
+	 * Caveat: this composes asid_cache(cpu)'s CURRENT gen_low with the
+	 * *passed* asid, not the passed asid's own gen_low. That's exactly
+	 * right for activate_context()/switch_mm(). The tlbflush_32.c
+	 * save/restore dance instead does set_asid(saved_asid) where
+	 * saved_asid was captured by get_asid() (full tag, own gen_low) from
+	 * a *different* mm switched on the same cpu earlier -- so this
+	 * recomposes it with whatever gen_low is live now. That's harmless
+	 * today only because jcore's local_flush_tlb_one() is actually a
+	 * full local_flush_tlb_all() that ignores the programmed ASID_TAG
+	 * entirely; it would be a latent bug if local_flush_tlb_one() ever
+	 * became a tag-qualified single-entry invalidate.
 	 */
-	unsigned long tag = jcore_encode_asid_tag(asid, 0);
+	unsigned long gen = asid_cache(raw_smp_processor_id());
+	unsigned long tag = jcore_encode_asid_tag(asid, gen);
 
-	__asm__ __volatile__ ("ldc %0, asidr"
-			      : : "r" (tag));
+	__asm__ __volatile__ ("ldc %0, asidr" : : "r" (tag));
 }
 
 static inline unsigned long get_asid(void)
 {
-	unsigned long asid;
+	unsigned long tag;
 
-	__asm__ __volatile__ ("stc asidr, %0"
-			      : "=r" (asid));
-	return asid & MMU_CONTEXT_ASID_MASK;
+	__asm__ __volatile__ ("stc asidr, %0" : "=r" (tag));
+	/*
+	 * Return the full 16-bit ASID_TAG (asid | gen_low<<12), not just the
+	 * 12-bit ASID: tlbflush_32.c saves this and restores it verbatim via
+	 * set_asid(), so gen_low must survive the round-trip.
+	 *
+	 * MMU_NO_ASID sentinel invariant: MMU_NO_ASID is 0x10000 (bit 16;
+	 * see mmu_context.h), which is unrepresentable in the 16-bit tag
+	 * returned here. Every possible saved_asid = get_asid() value is
+	 * therefore provably != MMU_NO_ASID, unconditionally -- no
+	 * reasoning about live user mm / asid != 0 is needed.
+	 */
+	return tag & 0xffff;
 }
 
 /*
