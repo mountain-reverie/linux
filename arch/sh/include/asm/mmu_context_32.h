@@ -23,6 +23,16 @@ static inline u16 jcore_encode_asid_tag(u16 asid, u64 gen)
 			<< JCORE_ASID_GEN_SHIFT);
 }
 
+/*
+ * True iff version bump lands gen_low back on 0 (every 16th rollover) --
+ * point where gen_low nibble is about to be reused. Triggers TSB rebuild
+ * to reject stale entries per security-review S-I3.
+ */
+static inline bool jcore_asid_gen_wrapped(unsigned long ctx)
+{
+	return (((ctx >> JCORE_ASID_GEN_SHIFT) & JCORE_ASID_GEN_MASK) == 0);
+}
+
 static inline void set_asid(unsigned long asid)
 {
 	/*
