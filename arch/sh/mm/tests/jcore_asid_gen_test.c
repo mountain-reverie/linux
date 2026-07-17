@@ -1,5 +1,5 @@
 /* Host-compiled (gcc, not cross). Proves ASID_TAG generation threading
- * gen_low-wrap detection */
+ * and gen_low-wrap detection */
 #include <assert.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -62,6 +62,10 @@ static void test_gen_wrap_predicate(void)
 
 	/* version 32 -> gen_low 0 (wrapped) */
 	assert(jcore_asid_gen_wrapped((0x20UL << 12)) == true);
+
+	/* ctx == 0 (full wrap: asid=0, gen_low=0) -- the security-critical
+	 * trigger case, must be detected as wrapped */
+	assert(jcore_asid_gen_wrapped(0) == true);
 }
 
 int main(void)
