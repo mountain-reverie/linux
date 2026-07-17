@@ -116,6 +116,17 @@ static inline void get_mmu_context(struct mm_struct *mm, unsigned int cpu)
 		 * an ad hoc IPI here).
 		 */
 		local_flush_tlb_all();
+		/*
+		 * Called with the PRE-fixup asid on purpose. On a normal
+		 * generation wrap asid != 0 and the version-0 fixup below is a
+		 * no-op, so pre/post are identical. But on a full 32-bit wrap
+		 * (asid == 0) the pre-fixup value has gen_low == 0, so
+		 * jcore_asid_gen_wrapped() zeros the TSB -- which is exactly
+		 * right, since a full wrap restarts the version numbering and
+		 * every old TSB entry is now aliasable. The post-fixup value
+		 * (MMU_CONTEXT_FIRST_VERSION, gen_low == 1) would MISS that case.
+		 * Do not move this below the fixup.
+		 */
 		jcore_tsb_flush_on_generation(asid);
 
 		/*
