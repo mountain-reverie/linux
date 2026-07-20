@@ -64,18 +64,18 @@
 	.macro	JCORE_TLB_FASTPATH
 	stc	tsbptr, r0
 	mov.l	@r0+, r1		/* r1 = tag_hi (expected VPN); r0 += 4 */
-	stc	pteh, r2		/* r2 = faulting VPN */
-	cmp/eq	r1, r2			/* VPN match? */
+	cmp/eq	pteh, r1		/* VPN match? -- fused CSR-vs-Rn compare
+					 * (reads PTEH onto ybus + sets T in one
+					 * insn; replaces stc pteh,r2 + cmp/eq). */
 	bf	jcore_tlb_miss_slow
 	mov.l	@r0+, r1		/* r1 = tag_lo (expected ASID_TAG); r0 += 4 */
 	mov.l	@r0, r3			/* r3 = TTE data (PTEL) -- loaded here so its
 					 * load-use latency hides behind the ASID
-					 * stc/cmp/bf and 'ldc r3,ptel' never stalls.
+					 * compare/bf and 'ldc r3,ptel' never stalls.
 					 * Harmless on a miss (r3 is scratch). */
-	stc	asidr, r2		/* r2 = current ASID_TAG */
-	cmp/eq	r1, r2			/* ASID_TAG match? */
+	cmp/eq	asidr, r1		/* ASID_TAG match? -- fused compare */
 	bf	jcore_tlb_miss_slow
-	ldc	r3, ptel		/* r3 ready (loaded 3 insns ago; no stall) */
+	ldc	r3, ptel		/* r3 ready (loaded 2 insns ago; no stall) */
 	ldtlb.rn			/* install TLB entry + return (no delay slot) */
 	.endm
 
