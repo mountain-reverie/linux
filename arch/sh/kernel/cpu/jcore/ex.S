@@ -75,8 +75,9 @@
 					 * Harmless on a miss (r3 is scratch). */
 	cmp/eq	asidr, r1		/* ASID_TAG match? -- fused compare */
 	bf	jcore_tlb_miss_slow
-	ldc	r3, ptel		/* r3 ready (loaded 2 insns ago; no stall) */
-	ldtlb.rn			/* install TLB entry + return (no delay slot) */
+	ldtlb.rn r3			/* PTEL<-r3 (loaded 2 insns ago) + install + return
+					 * in one insn -- fused LDC+LDTLB.RN. Slow path
+					 * still uses plain ldtlb.rn (walker sets PTEL CSR). */
 	.endm
 
 !
