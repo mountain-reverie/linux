@@ -11,23 +11,26 @@
  * (see arch/sh/mm/tests/jcore_pte_to_ptel_test.c and SP2's bare-metal
  * harness).
  *
- * Page size is fixed at 16 KB (PAGE_SHIFT == 14), so a page-aligned
- * physical address always has its low 14 bits clear.
+ * The BASE page size is fixed at 16 KB (PAGE_SHIFT == 14), so a
+ * page-aligned physical address always has its low 14 bits clear.
+ * HugeTLB pages of 64K..256M also exist; which size a given PTE
+ * describes is encoded per-PTE in the 3-bit size slot below
+ * (_PAGE_JCORE_SZ_BITS, bits 10/12/13).
  *
  * ---------------------------------------------------------------------
  * Linux pte_t (pte_low, 32-bit) layout chosen for jcore:
  *
  *   bit:  31........14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
- *         |   PFN     |-r-|SP|-r-|PN|AC|WR|EX|US|DI|CA|GL|ST|VA|
+ *         |   PFN     |SZ2|SZ1|SP|SZ0|PN|AC|WR|EX|US|DI|CA|GL|ST|VA|
  *
  *   31:14  PFN            physical page number (PA[31:14]), same
  *                         convention as the rest of arch/sh (pfn_pte()
  *                         shifts the pfn left by PAGE_SHIFT and ORs in
  *                         pgprot_val()).
- *   12:13  reserved       spare software bits (swap-entry type/offset
- *                         extension, currently unused)
+ *   13,12  _PAGE_JCORE_SZ_BITS[2:1]  page-size slot bits 2 and 1 (see
+ *                         below); named SZ2/SZ1 in the diagram above.
  *   11     _PAGE_SPECIAL  software only (0x800, NOT bit 10)
- *   10     reserved       spare software bit (currently unused)
+ *   10     _PAGE_JCORE_SZ_BITS[0]  page-size slot bit 0 (SZ0 above)
  *    9     _PAGE_PROTNONE software only (vma protection None)
  *    8     _PAGE_ACCESSED software only (referenced)
  *    7     _PAGE_WRITE    hw: PTEL.W  (bit 7)
@@ -124,9 +127,7 @@ static inline unsigned long jcore_pte_set_size(unsigned long pte_val, unsigned i
 	pte_val |= ((slot & 1UL) << 10) | ((slot & 2UL) << 11) | ((slot & 4UL) << 11);
 	return pte_val;
 }
-#endif /* !__ASSEMBLY__ */
 
-#ifndef __ASSEMBLY__
 /*
  * jcore_pte_to_ptel() - convert a Linux pte_t value into the hardware
  * PTEL image the J4 MMU TLB-fill/walker expects.

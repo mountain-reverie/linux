@@ -36,6 +36,12 @@
 #define HPAGE_SIZE		(1UL << HPAGE_SHIFT)
 #define HPAGE_MASK		(~(HPAGE_SIZE-1))
 #define HUGETLB_PAGE_ORDER	(HPAGE_SHIFT-PAGE_SHIFT)
+
+#ifdef CONFIG_CPU_JCORE
+/* jcore registers seven runtime huge sizes (64K..256M); the generic
+ * default of 1 would BUG_ON at the second hugetlb_add_hstate(). */
+#define HUGE_MAX_HSTATE 8
+#endif
 #endif
 
 #ifndef __ASSEMBLER__
