@@ -11,23 +11,26 @@
  * (see arch/sh/mm/tests/jcore_pte_to_ptel_test.c and SP2's bare-metal
  * harness).
  *
- * Page size is fixed at 16 KB (PAGE_SHIFT == 14), so a page-aligned
- * physical address always has its low 14 bits clear.
+ * The BASE page size is fixed at 16 KB (PAGE_SHIFT == 14), so a
+ * page-aligned physical address always has its low 14 bits clear.
+ * HugeTLB pages of 64K..256M also exist; which size a given PTE
+ * describes is encoded per-PTE in the 3-bit size slot below
+ * (_PAGE_JCORE_SZ_BITS, bits 10/12/13).
  *
  * ---------------------------------------------------------------------
  * Linux pte_t (pte_low, 32-bit) layout chosen for jcore:
  *
  *   bit:  31........14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
- *         |   PFN     |-r-|SP|-r-|PN|AC|WR|EX|US|DI|CA|GL|ST|VA|
+ *         |   PFN     |SZ2|SZ1|SP|SZ0|PN|AC|WR|EX|US|DI|CA|GL|ST|VA|
  *
  *   31:14  PFN            physical page number (PA[31:14]), same
  *                         convention as the rest of arch/sh (pfn_pte()
  *                         shifts the pfn left by PAGE_SHIFT and ORs in
  *                         pgprot_val()).
- *   12:13  reserved       spare software bits (swap-entry type/offset
- *                         extension, currently unused)
+ *   13,12  _PAGE_JCORE_SZ_BITS[2:1]  page-size slot bits 2 and 1 (see
+ *                         below); named SZ2/SZ1 in the diagram above.
  *   11     _PAGE_SPECIAL  software only (0x800, NOT bit 10)
- *   10     reserved       spare software bit (currently unused)
+ *   10     _PAGE_JCORE_SZ_BITS[0]  page-size slot bit 0 (SZ0 above)
  *    9     _PAGE_PROTNONE software only (vma protection None)
  *    8     _PAGE_ACCESSED software only (referenced)
  *    7     _PAGE_WRITE    hw: PTEL.W  (bit 7)
@@ -103,7 +106,28 @@
 #define _PAGE_JCORE_PPN_SHIFT		10
 #define _PAGE_JCORE_PAGEMASK_SHIFT	8
 
+/* 3-bit page-size slot packed into free flag bits {10,12,13}:
+ *   slot bit0 -> pte bit10, bit1 -> bit12, bit2 -> bit13.
+ * slot 0 = base (16 KB); slots 1..7 = 64K,256K,1M,4M,16M,64M,256M.
+ * Helpers are unsigned-long based so this header stays host-compilable. */
+#define _PAGE_JCORE_SZ_BITS	((1UL<<10) | (1UL<<12) | (1UL<<13))
+
 #ifndef __ASSEMBLY__
+/* slot -> hardware PageMask pm (page size = 4KB << 2*pm) */
+static const unsigned char jcore_pm_for_slot[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+static inline unsigned int jcore_pte_size_slot(unsigned long pte_val)
+{
+	return ((pte_val >> 10) & 1) | ((pte_val >> 11) & 2) | ((pte_val >> 11) & 4);
+}
+
+static inline unsigned long jcore_pte_set_size(unsigned long pte_val, unsigned int slot)
+{
+	pte_val &= ~_PAGE_JCORE_SZ_BITS;
+	pte_val |= ((slot & 1UL) << 10) | ((slot & 2UL) << 11) | ((slot & 4UL) << 11);
+	return pte_val;
+}
+
 /*
  * jcore_pte_to_ptel() - convert a Linux pte_t value into the hardware
  * PTEL image the J4 MMU TLB-fill/walker expects.
@@ -124,7 +148,8 @@ static inline unsigned long jcore_pte_to_ptel(unsigned long pte_val)
 {
 	unsigned long ppn = pte_val & ~0x3FFFUL;	/* PA[31:14], low 14 bits are flags */
 	unsigned long hwbits = pte_val & _PAGE_HW_BITS_MASK; /* bits 0..7, hw-positioned already */
-	unsigned long pagemask = _PAGE_JCORE_PAGEMASK_16KB << _PAGE_JCORE_PAGEMASK_SHIFT;
+	unsigned long pagemask = (unsigned long)jcore_pm_for_slot[jcore_pte_size_slot(pte_val)]
+				 << _PAGE_JCORE_PAGEMASK_SHIFT;
 
 	return ppn | pagemask | hwbits;
 }

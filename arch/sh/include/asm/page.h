@@ -18,7 +18,9 @@
  * documents that CONFIG_PAGE_SIZE_16KB is reachable/expected here. */
 #endif
 
-#if defined(CONFIG_HUGETLB_PAGE_SIZE_64K)
+#ifdef CONFIG_CPU_JCORE
+#define HPAGE_SHIFT	20		/* default hstate = 1 MB; all sizes runtime-registered */
+#elif defined(CONFIG_HUGETLB_PAGE_SIZE_64K)
 #define HPAGE_SHIFT	16
 #elif defined(CONFIG_HUGETLB_PAGE_SIZE_256K)
 #define HPAGE_SHIFT	18
@@ -34,6 +36,12 @@
 #define HPAGE_SIZE		(1UL << HPAGE_SHIFT)
 #define HPAGE_MASK		(~(HPAGE_SIZE-1))
 #define HUGETLB_PAGE_ORDER	(HPAGE_SHIFT-PAGE_SHIFT)
+
+#ifdef CONFIG_CPU_JCORE
+/* jcore registers seven runtime huge sizes (64K..256M); the generic
+ * default of 1 would BUG_ON at the second hugetlb_add_hstate(). */
+#define HUGE_MAX_HSTATE 8
+#endif
 #endif
 
 #ifndef __ASSEMBLER__

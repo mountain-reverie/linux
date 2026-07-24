@@ -170,6 +170,7 @@ config CPU_JCORE
 	select CPU_SH2
 	select OF
 	select OF_EARLY_FLATTREE
+	select ARCH_SUPPORTS_HUGETLBFS if MMU
 
 config CPU_SH3
 	bool
