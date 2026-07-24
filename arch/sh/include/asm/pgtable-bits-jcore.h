@@ -103,6 +103,29 @@
 #define _PAGE_JCORE_PPN_SHIFT		10
 #define _PAGE_JCORE_PAGEMASK_SHIFT	8
 
+/* 3-bit page-size slot packed into free flag bits {10,12,13}:
+ *   slot bit0 -> pte bit10, bit1 -> bit12, bit2 -> bit13.
+ * slot 0 = base (16 KB); slots 1..7 = 64K,256K,1M,4M,16M,64M,256M.
+ * Helpers are unsigned-long based so this header stays host-compilable. */
+#define _PAGE_JCORE_SZ_BITS	((1UL<<10) | (1UL<<12) | (1UL<<13))
+
+#ifndef __ASSEMBLY__
+/* slot -> hardware PageMask pm (page size = 4KB << 2*pm) */
+static const unsigned char jcore_pm_for_slot[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+static inline unsigned int jcore_pte_size_slot(unsigned long pte_val)
+{
+	return ((pte_val >> 10) & 1) | ((pte_val >> 11) & 2) | ((pte_val >> 11) & 4);
+}
+
+static inline unsigned long jcore_pte_set_size(unsigned long pte_val, unsigned int slot)
+{
+	pte_val &= ~_PAGE_JCORE_SZ_BITS;
+	pte_val |= ((slot & 1UL) << 10) | ((slot & 2UL) << 11) | ((slot & 4UL) << 11);
+	return pte_val;
+}
+#endif /* !__ASSEMBLY__ */
+
 #ifndef __ASSEMBLY__
 /*
  * jcore_pte_to_ptel() - convert a Linux pte_t value into the hardware
@@ -124,7 +147,8 @@ static inline unsigned long jcore_pte_to_ptel(unsigned long pte_val)
 {
 	unsigned long ppn = pte_val & ~0x3FFFUL;	/* PA[31:14], low 14 bits are flags */
 	unsigned long hwbits = pte_val & _PAGE_HW_BITS_MASK; /* bits 0..7, hw-positioned already */
-	unsigned long pagemask = _PAGE_JCORE_PAGEMASK_16KB << _PAGE_JCORE_PAGEMASK_SHIFT;
+	unsigned long pagemask = (unsigned long)jcore_pm_for_slot[jcore_pte_size_slot(pte_val)]
+				 << _PAGE_JCORE_PAGEMASK_SHIFT;
 
 	return ppn | pagemask | hwbits;
 }

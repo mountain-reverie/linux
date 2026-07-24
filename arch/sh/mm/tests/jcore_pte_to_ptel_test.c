@@ -3,8 +3,34 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #define CONFIG_CPU_JCORE 1
 #include "jcore_pte_to_ptel_host.h"   /* thin shim including the real logic */
+
+/* slot -> expected PageMask nibble at ptel[11:8]; pm table = {1,2,..,8} */
+static void test_size_slots(void)
+{
+	unsigned long base_pa = 0x00100000UL;          /* PA[31:14] set */
+	unsigned long flags   = _PAGE_VALID | _PAGE_CACHEABLE; /* bits 0,3 */
+	unsigned int slot;
+	static const unsigned pm[8] = {1,2,3,4,5,6,7,8};
+
+	for (slot = 0; slot < 8; slot++) {
+		unsigned long p = jcore_pte_set_size(base_pa | flags, slot);
+		unsigned long ptel = jcore_pte_to_ptel(p);
+		unsigned nib = (ptel >> 8) & 0xF;
+		if (nib != pm[slot]) { printf("slot %u: pm %u != %u\n", slot, nib, pm[slot]); exit(1); }
+	}
+	{
+		unsigned long a = jcore_pte_to_ptel(base_pa | flags);
+		unsigned long b = jcore_pte_to_ptel(jcore_pte_set_size(base_pa | flags, 0));
+		if (a != b) { printf("base != slot0: %#lx %#lx\n", a, b); exit(1); }
+	}
+	for (slot = 0; slot < 8; slot++)
+		if (jcore_pte_size_slot(jcore_pte_set_size(base_pa | flags, slot)) != slot)
+			{ printf("slot %u round-trip failed\n", slot); exit(1); }
+	printf("test_size_slots OK\n");
+}
 
 /*
  * Standalone mirror of the non-X2TLB swap-pte encoding from
@@ -110,6 +136,7 @@ int main(void)
 	assert((stptel & 0xFF) == (_PAGE_VALID | _PAGE_STALE));
 
 	test_swp_exclusive_no_collision();
+	test_size_slots();
 
 	printf("jcore_pte_to_ptel: all asserts passed\n");
 	return 0;
