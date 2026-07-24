@@ -70,3 +70,17 @@ pte_t *huge_pte_offset(struct mm_struct *mm,
 
 	return pte;
 }
+
+#ifdef CONFIG_CPU_JCORE
+static __init int jcore_hugetlb_init(void)
+{
+	/* Register every hardware-supported huge size (64K..256M). Orders are
+	 * relative to PAGE_SHIFT(14): shift 16..28 in steps of 2 (x4 each). */
+	unsigned int shift;
+
+	for (shift = 16; shift <= 28; shift += 2)
+		hugetlb_add_hstate(shift - PAGE_SHIFT);
+	return 0;
+}
+arch_initcall(jcore_hugetlb_init);
+#endif /* CONFIG_CPU_JCORE */
