@@ -18,7 +18,9 @@
  * documents that CONFIG_PAGE_SIZE_16KB is reachable/expected here. */
 #endif
 
-#if defined(CONFIG_HUGETLB_PAGE_SIZE_64K)
+#ifdef CONFIG_CPU_JCORE
+#define HPAGE_SHIFT	20		/* default hstate = 1 MB; all sizes runtime-registered */
+#elif defined(CONFIG_HUGETLB_PAGE_SIZE_64K)
 #define HPAGE_SHIFT	16
 #elif defined(CONFIG_HUGETLB_PAGE_SIZE_256K)
 #define HPAGE_SHIFT	18
