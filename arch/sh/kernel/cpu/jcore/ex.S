@@ -4,25 +4,21 @@
  *
  * J-Core J4 fixed TLB-miss vectors + software TLB-miss handler.
  *
- * Unlike SH-3/SH-4 (single vector + EXPEVT-indexed exception_handling_
- * table), J4 delivers TLB misses to three distinct, hardware-fixed VBR
- * offsets by access type (SP0 vector decision; see the
- * mmu-m3-vector-decision project note and docs/mmu/design-spec.md):
+ * Like SH-3/SH-4, J4 delivers ALL TLB faults to a single hardware-fixed
+ * vector, VBR + 0x400 (I/D, miss/protection alike; see the
+ * mmu-m3-vector-decision project note and docs/mmu/design-spec.md). The
+ * six causes are still distinguishable via EXPEVT on the slow path, but
+ * the hot path never needs to: by the time it fires, hardware has already
+ * loaded PTEH/ASIDR/TSBPTR for the faulting access, so there is nothing
+ * left to distinguish. (An earlier SP0 layout gave each access type its
+ * own vector -- 0x400/0x420/0x440 -- but the handler is byte-identical for
+ * all three, so that only triplicated the hot-path I-cache footprint.)
  *
- *   VBR + 0x400   I-side miss / I-side protection violation
- *   VBR + 0x420   D-side load miss
- *   VBR + 0x440   D-side store miss
- *
- * All three run the exact same hot path: by the time any fires, hardware
- * has already loaded PTEH/ASIDR/TSBPTR for the faulting access, so there
- * is nothing left to distinguish. Rather than have each vector *jump* to
- * a common routine -- which would cost a literal load + taken branch +
- * delay slot on every single TLB miss -- the fast path is INLINED at
- * each fixed vector (the JCORE_TLB_FASTPATH macro). Hardware lands
- * directly on the first instruction of the fast path; a TSB hit runs
- * straight to LDTLB.RN with no taken branch. The machine code is
- * deliberately duplicated across the three vectors (the source is not,
- * thanks to the macro) because these vectors are as hot as the MMU gets.
+ * Rather than have the vector *jump* to a common routine -- which would
+ * cost a literal load + taken branch + delay slot on every single TLB
+ * miss -- the fast path is INLINED at the vector (the JCORE_TLB_FASTPATH
+ * macro). Hardware lands directly on the first instruction; a TSB hit runs
+ * straight to LDTLB.RN with no taken branch.
  *
  * The rarer paths -- a TSB miss (walk the page table in C) and a real
  * fault (hand off to do_page_fault) -- are shared, co-located below the
@@ -41,11 +37,9 @@
  * exceptions -- reusing sh2/entry.S's exception_handler dispatch
  * unchanged) so J4's generic non-MMU exception handling keeps working
  * byte-for-byte the same as plain SH-2. That table is exactly
- * 256 * 4 = 1024 = 0x400 bytes, so jcore_vec_imiss below begins at
+ * 256 * 4 = 1024 = 0x400 bytes, so jcore_vec_tlb below begins at
  * precisely jcore_vbr_base + 0x400 with no padding -- nothing may be
- * emitted between the .rept/.endr and jcore_vec_imiss. Each fast-path
- * copy is < 0x20 bytes and padded to a fixed 0x20 stride with .balign so
- * dload/dstore land exactly on +0x420/+0x440.
+ * emitted between the .rept/.endr and jcore_vec_tlb.
  */
 #include <linux/linkage.h>
 #include <cpu/mmu_context.h>
@@ -75,8 +69,9 @@
 					 * Harmless on a miss (r3 is scratch). */
 	cmp/eq	asidr, r1		/* ASID_TAG match? -- fused compare */
 	bf	jcore_tlb_miss_slow
-	ldc	r3, ptel		/* r3 ready (loaded 2 insns ago; no stall) */
-	ldtlb.rn			/* install TLB entry + return (no delay slot) */
+	ldtlb.rn r3			/* PTEL<-r3 (loaded 2 insns ago) + install + return
+					 * in one insn -- fused LDC+LDTLB.RN. Slow path
+					 * still uses plain ldtlb.rn (walker sets PTEL CSR). */
 	.endm
 
 !
@@ -108,9 +103,9 @@ $jcore_exception_handler:
 !
 ! J4 Exception Vector Base -- VBR is pointed here (not at sh2/ex.S's
 ! vbr_base) for CONFIG_CPU_JCORE; see per_cpu_trap_init() (traps_32.c).
-! Must itself be 0x20-aligned so the absolute .balign 0x20 padding
-! between the fixed TLB-miss stubs below lands on +0x400/+0x420/+0x440
-! relative to this symbol (not just some arbitrary 0x20 boundary).
+! Must itself be 0x20-aligned so the 0x400-byte generic-exception table
+! below places the inlined TLB fast path at exactly +0x400 relative to
+! this symbol (not just some arbitrary boundary).
 !
 	.balign	0x20
 ENTRY(jcore_vbr_base)
@@ -120,21 +115,13 @@ vector	=	0
 vector	=	vector + 1
 	.endr
 ! --- exactly 0x400 bytes above this point; do not insert an .align ---
-ENTRY(jcore_vec_imiss)			/* VBR + 0x400: I-side miss/protection */
+ENTRY(jcore_vec_tlb)			/* VBR + 0x400: ALL TLB faults (I/D, miss/prot) */
 ENTRY(jcore_tlb_miss)			/* alias: SP2 bare-metal harness entry */
-	JCORE_TLB_FASTPATH
-	.balign	0x20
-
-ENTRY(jcore_vec_dload)			/* VBR + 0x420: D-side load miss */
-	JCORE_TLB_FASTPATH
-	.balign	0x20
-
-ENTRY(jcore_vec_dstore)			/* VBR + 0x440: D-side store miss */
 	JCORE_TLB_FASTPATH
 
 !
-! Shared slow path (one copy). Reached by BF from any of the three
-! inlined fast paths above when the TSB probe misses. Walks the real
+! Shared slow path (one copy). Reached by BF from the inlined fast path
+! above when the TSB probe misses. Walks the real
 ! page table in C; on success installs the entry, on failure hands off
 ! to the pt_regs-building real-fault tail in entry.S.
 !
@@ -193,6 +180,4 @@ jcore_tlb_real_fault:
 
 	.align	4
 ENTRY(jcore_tlb_vectors)
-	.long	jcore_vec_imiss		/* VBR + 0x400 */
-	.long	jcore_vec_dload		/* VBR + 0x420 */
-	.long	jcore_vec_dstore	/* VBR + 0x440 */
+	.long	jcore_vec_tlb		/* VBR + 0x400: all TLB faults (I/D, miss/prot) */
