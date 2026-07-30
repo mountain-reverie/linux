@@ -49,11 +49,37 @@
 /*
  * The shared TLB-miss fast path, inlined verbatim at each fixed vector.
  * Two separate CMP/EQ (VPN vs PTEH, then ASID_TAG vs ASIDR) avoid any
- * VPN/ASID-bit-overlap ambiguity. On a TSB hit this runs to LDTLB.RN
- * with NO taken branch. On a miss it falls to jcore_tlb_miss_slow. Each
+ * VPN/ASID-bit-overlap ambiguity. On a TSB hit that is a genuine MISS
+ * (EXPEVT < 0x0A0) this runs to LDTLB.RN with NO taken branch. Each
  * TSB slot is 3 words: tag_hi (VPN), tag_lo (ASID_TAG), data (PTEL).
  * Uses only bank-1 scratch (r0-r3) and no literal pool, so one copy is
- * 12 insns = 24 bytes and fits inside the 0x20 vector stride.
+ * 16 insns = 32 bytes and fits exactly inside the 0x20 vector stride.
+ *
+ * PROTECTION FAULTS: because all six TLB causes share this one vector,
+ * a *protection* fault (EXPEVT 0x0A0 IPROT, 0x0C0 DPROT_R/W) against a
+ * VPN/ASID that already has a valid TSB slot also TSB-hits here. Simply
+ * running LDTLB.RN would reinstall the identical (e.g. read-only)
+ * entry and let the faulting instruction retry -- an infinite livelock,
+ * since do_page_fault() is never reached to fix the pte up. So on a TSB
+ * hit we additionally check EXPEVT and divert protection faults to
+ * jcore_tlb_fastpath_prot (which hands off to the real do_page_fault()
+ * tail) instead of falling through to LDTLB.RN.
+ *
+ * EXPEVT is read in-core (STC EXPEVT, encoded .word 0x0052-family --
+ * this assembler does not know the mnemonic, matching the convention
+ * already used for the other MMU overlay opcodes in this tree, e.g.
+ * sim/tests/mmufault.S) rather than via the P4 MMIO alias: this is the
+ * hottest path in the kernel and an uncached P4 read here would cost
+ * tens of cycles for no reason.
+ *
+ * The EXPEVT>=0x0A0 test avoids 'mov #imm,Rn' sign-extension pitfalls
+ * (mov #0xA0,rN would yield 0xFFFFFFA0, not 0xA0) by first subtracting
+ * 128 (0x80, representable directly as an 8-bit signed immediate) and
+ * then testing strictly-positive with CMP/PL: EXPEVT-128 > 0 iff
+ * EXPEVT > 0x80 iff EXPEVT is IPROT/DPROT_R/DPROT_W (0x0A0 or 0x0C0);
+ * EXPEVT-128 <= 0 for IMISS/DMISS_R/DMISS_W (0x040/0x060/0x080). The
+ * known EXPEVT lossiness (DPROT_R vs DPROT_W both read back 0x0C0)
+ * does not matter here since both are protection faults.
  */
 	.macro	JCORE_TLB_FASTPATH
 	stc	tsbptr, r0
@@ -69,7 +95,13 @@
 					 * Harmless on a miss (r3 is scratch). */
 	cmp/eq	asidr, r1		/* ASID_TAG match? -- fused compare */
 	bf	jcore_tlb_miss_slow
-	ldtlb.rn r3			/* PTEL<-r3 (loaded 2 insns ago) + install + return
+	.word	0x0252			/* stc expevt, r2 */
+	add	#-128, r2		/* r2 = EXPEVT - 0x80 */
+	cmp/pl	r2			/* T = (EXPEVT > 0x80), i.e. a protection
+					 * fault (0x0A0/0x0C0) rather than a miss
+					 * (0x040/0x060/0x080) */
+	bt	jcore_tlb_fastpath_prot
+	ldtlb.rn r3			/* PTEL<-r3 (loaded 4 insns ago) + install + return
 					 * in one insn -- fused LDC+LDTLB.RN. Slow path
 					 * still uses plain ldtlb.rn (walker sets PTEL CSR). */
 	.endm
@@ -118,6 +150,28 @@ vector	=	vector + 1
 ENTRY(jcore_vec_tlb)			/* VBR + 0x400: ALL TLB faults (I/D, miss/prot) */
 ENTRY(jcore_tlb_miss)			/* alias: SP2 bare-metal harness entry */
 	JCORE_TLB_FASTPATH
+
+!
+! Reached by BT from the inlined fast path above on a TSB hit whose
+! EXPEVT says protection fault, not miss. Unlike jcore_tlb_miss_slow's
+! jcore_tlb_real_fault, no r4-r7/PR save/restore is needed here: the
+! fast path above never touches PR or bank-1 r4-r7, so register state
+! already matches what jcore_tlb_fault_entry expects on entry (see its
+! header comment in entry.S). Hands off directly to the pt_regs-building
+! real-fault tail; do_page_fault() re-walks the page table and will
+! grant write access (setting _PAGE_DIRTY) if this was in fact a
+! copy-on-write/dirty-tracking fault rather than a true permission
+! violation -- routing through jcore_tlb_miss_slow's walker instead
+! would be pointless, since a page-table walk cannot fix up a
+! protection fault on an already-present, already-valid pte.
+!
+	.align	4
+jcore_tlb_fastpath_prot:
+	mov.l	5f, r0
+	jmp	@r0
+	 nop
+	.align	4
+5:	.long	jcore_tlb_fault_entry
 
 !
 ! Shared slow path (one copy). Reached by BF from the inlined fast path
