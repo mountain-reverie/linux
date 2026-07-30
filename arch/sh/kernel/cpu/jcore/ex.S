@@ -47,13 +47,21 @@
 	.text
 
 /*
- * The shared TLB-miss fast path, inlined verbatim at each fixed vector.
+ * The TLB-miss fast path, inlined verbatim at the one fixed vector
+ * (jcore_vec_tlb, VBR+0x400 -- see the M3 single-vector decision above).
  * Two separate CMP/EQ (VPN vs PTEH, then ASID_TAG vs ASIDR) avoid any
  * VPN/ASID-bit-overlap ambiguity. On a TSB hit that is a genuine MISS
- * (EXPEVT < 0x0A0) this runs to LDTLB.RN with NO taken branch. Each
- * TSB slot is 3 words: tag_hi (VPN), tag_lo (ASID_TAG), data (PTEL).
- * Uses only bank-1 scratch (r0-r3) and no literal pool, so one copy is
- * 16 insns = 32 bytes and fits exactly inside the 0x20 vector stride.
+ * (EXPEVT < 0x0A0) this runs to LDTLB.RN with NO taken branch -- but
+ * every TSB hit, miss or not, now pays 4 extra straight-line insns
+ * (STC EXPEVT, ADD, CMP/PL, a not-taken BT) to make that determination;
+ * see the EXPEVT paragraph below. Each TSB slot is 3 words: tag_hi
+ * (VPN), tag_lo (ASID_TAG), data (PTEL). Uses only bank-1 scratch
+ * (r0-r3) and no literal pool, so the whole macro is 13 insns = 26
+ * bytes -- 6 bytes of headroom inside the 0x20 vector stride, enforced
+ * at build time by the '.org jcore_vec_tlb + 0x20' assertion right
+ * after its expansion below (recount before trusting any prose
+ * description of this size, including this one -- it has been wrong
+ * twice already).
  *
  * PROTECTION FAULTS: because all six TLB causes share this one vector,
  * a *protection* fault (EXPEVT 0x0A0 IPROT, 0x0C0 DPROT_R/W) against a
@@ -150,6 +158,19 @@ vector	=	vector + 1
 ENTRY(jcore_vec_tlb)			/* VBR + 0x400: ALL TLB faults (I/D, miss/prot) */
 ENTRY(jcore_tlb_miss)			/* alias: SP2 bare-metal harness entry */
 	JCORE_TLB_FASTPATH
+	! Build-time stride assert: the next fixed vector begins at
+	! jcore_vec_tlb + 0x20, so an edit that grows the macro past that
+	! must fail the build here instead of silently corrupting whatever
+	! follows -- a prose comment claiming a byte count is not a
+	! substitute for the assembler checking it. A plain '.if (. -
+	! jcore_vec_tlb) > 0x20' does NOT work with this assembler: BF/BT
+	! inside the macro are relaxable (variable-length until link-time
+	! relaxation), so '.' minus a backward label spanning them is a
+	! non-constant expression at .if-evaluation time and errors out
+	! unconditionally, pass or fail. '.org' has no such restriction --
+	! it errors iff the location counter has already moved past the
+	! target when reached, which is exactly the assert we want.
+	.org	jcore_vec_tlb + 0x20
 
 !
 ! Reached by BT from the inlined fast path above on a TSB hit whose
