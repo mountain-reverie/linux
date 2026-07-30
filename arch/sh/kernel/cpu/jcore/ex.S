@@ -158,11 +158,14 @@ vector	=	vector + 1
 ENTRY(jcore_vec_tlb)			/* VBR + 0x400: ALL TLB faults (I/D, miss/prot) */
 ENTRY(jcore_tlb_miss)			/* alias: SP2 bare-metal harness entry */
 	JCORE_TLB_FASTPATH
-	! Build-time stride assert: the next fixed vector begins at
-	! jcore_vec_tlb + 0x20, so an edit that grows the macro past that
-	! must fail the build here instead of silently corrupting whatever
-	! follows -- a prose comment claiming a byte count is not a
-	! substitute for the assembler checking it. A plain '.if (. -
+	! Build-time size assert: the fast path is budgeted 0x20 bytes and
+	! this pads it out to that 32-byte boundary. There is no further
+	! fixed vector after jcore_vec_tlb -- the budget is a self-imposed
+	! ceiling on the hot path, not a hardware stride -- but an edit that
+	! grows the macro past it must still fail the build here instead of
+	! silently pushing the code that follows around; a prose comment
+	! claiming a byte count is not a substitute for the assembler
+	! checking it. A plain '.if (. -
 	! jcore_vec_tlb) > 0x20' does NOT work with this assembler: BF/BT
 	! inside the macro are relaxable (variable-length until link-time
 	! relaxation), so '.' minus a backward label spanning them is a
