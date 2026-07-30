@@ -103,8 +103,14 @@ ENTRY(jcore_tlb_fault_entry)
 	mov.l	r1, @(r0, r15)
 
 	mov	r15, r4			! arg0: regs
-	mov	#0, r5			! arg1: error_code (not yet threaded
-					!  through from tlbmiss.S; TODO(SP3): pass real fault error_code once the runtime fault path is exercised; harmless while SP1 is build/link-only)
+	! arg1: error_code, MMUFSR. low byte laid out as
+	! FAULT_CODE_* image (USER/PROT/ITLB/INITIAL/WRITE) so no mapping
+	! needed; extu.b drops diagnostic KIND/VALID field above it.
+	! MMUFSR overwritten by next fault episode, so read here before
+	! interrupts enabled or user page tables touched.
+	mov.l	3f, r5
+	mov.l	@r5, r5			! read MMUFSR
+	extu.b	r5, r5			! extract low byte (error_code)
 	mov.l	1f, r6
 	mov.l	@r6, r6			! arg2: faulting address (MMU_TEA)
 
@@ -166,3 +172,4 @@ ENTRY(jcore_tlb_fault_entry)
 	.align	4
 1:	.long	MMU_TEA
 2:	.long	do_page_fault
+3:	.long	MMU_FSR
