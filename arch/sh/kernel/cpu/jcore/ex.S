@@ -73,12 +73,12 @@
  * jcore_tlb_fastpath_prot (which hands off to the real do_page_fault()
  * tail) instead of falling through to LDTLB.RN.
  *
- * EXPEVT is read in-core (STC EXPEVT, encoded .word 0x0052-family --
- * this assembler does not know the mnemonic, matching the convention
- * already used for the other MMU overlay opcodes in this tree, e.g.
- * sim/tests/mmufault.S) rather than via the P4 MMIO alias: this is the
- * hottest path in the kernel and an uncached P4 read here would cost
- * tens of cycles for no reason.
+ * EXPEVT is read in-core (`stc expevt, r2`) rather than via the P4 MMIO
+ * alias: this is the hottest path in the kernel and an uncached P4 read
+ * here would cost tens of cycles for no reason. The mnemonic needs a
+ * J4-aware assembler (mountain-reverie/binutils-gdb, branch jcore) and
+ * -Wa,-isa=sh-jcore, which arch/sh/Makefile already passes for
+ * CONFIG_CPU_SUBTYPE_JCORE via as-option.
  *
  * The EXPEVT>=0x0A0 test avoids 'mov #imm,Rn' sign-extension pitfalls
  * (mov #0xA0,rN would yield 0xFFFFFFA0, not 0xA0) by first subtracting
@@ -103,7 +103,7 @@
 					 * Harmless on a miss (r3 is scratch). */
 	cmp/eq	asidr, r1		/* ASID_TAG match? -- fused compare */
 	bf	jcore_tlb_miss_slow
-	.word	0x0252			/* stc expevt, r2 */
+	stc	expevt, r2		/* r2 = EXPEVT (0x0252) */
 	add	#-128, r2		/* r2 = EXPEVT - 0x80 */
 	cmp/pl	r2			/* T = (EXPEVT > 0x80), i.e. a protection
 					 * fault (0x0A0/0x0C0) rather than a miss
