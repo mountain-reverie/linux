@@ -115,6 +115,28 @@ int main(void)
 	assert((hptel & 0xFFFFFC00UL) == (0xABCD4000UL & 0xFFFFFC00UL));
 	assert((hptel & 0xFFFFFC00UL) == 0xABCD4000UL);
 
+	/* Clean writable page (WRITE set, DIRTY clear) must have W withheld
+	 * to trap the first write and let generic mm set _PAGE_DIRTY. */
+	unsigned long cwte = _PAGE_VALID|_PAGE_WRITE|_PAGE_CACHEABLE|_PAGE_GLOBAL | 0x00004000UL;
+	unsigned long cwtel = jcore_pte_to_ptel(cwte);
+	assert((cwtel >> 7 & 1) == 0);           /* W7 must be clear (withheld) */
+	assert((cwtel >> 4 & 1) == 0);           /* D4 clear (no DIRTY in input) */
+	assert((cwtel >> 3 & 1) == 1);           /* C3 set (CACHEABLE in input) */
+	assert((cwtel >> 2 & 1) == 1);           /* G2 set (GLOBAL in input) */
+	assert((cwtel >> 0 & 1) == 1);           /* V0 set (VALID in input) */
+	assert((cwtel & 0xFFFFFC00) == 0x00004000); /* PPN unchanged */
+
+	/* Dirty writable page (WRITE and DIRTY both set) must have W set so
+	 * the page installs writable without trapping on first write. */
+	unsigned long dwte = _PAGE_VALID|_PAGE_WRITE|_PAGE_DIRTY|_PAGE_CACHEABLE|_PAGE_GLOBAL | 0x00004000UL;
+	unsigned long dwtel = jcore_pte_to_ptel(dwte);
+	assert((dwtel >> 7 & 1) == 1);           /* W7 must be set */
+	assert((dwtel >> 4 & 1) == 1);           /* D4 set (DIRTY in input) */
+	assert((dwtel >> 3 & 1) == 1);           /* C3 set (CACHEABLE in input) */
+	assert((dwtel >> 2 & 1) == 1);           /* G2 set (GLOBAL in input) */
+	assert((dwtel >> 0 & 1) == 1);           /* V0 set (VALID in input) */
+	assert((dwtel & 0xFFFFFC00) == 0x00004000); /* PPN unchanged */
+
 	/* Software-only bits must never leak into the hw PTEL image. */
 	unsigned long spte = _PAGE_VALID | _PAGE_ACCESSED | _PAGE_PROTNONE |
 			     _PAGE_SPECIAL | (0x00004000UL);

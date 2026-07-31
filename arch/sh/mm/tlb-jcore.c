@@ -128,15 +128,53 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 }
 
 /*
+ * jcore_tsb_slot_offset() - byte offset, within the boot TSB, of the slot
+ * hardware would compute in TSBPTR for a fault at @addr.
+ *
+ * Must mirror the RTL bit-for-bit (jcore-cpu core/datapath.vhm, the "TSB
+ * pointer assist" block; hardware-spec.md §2.8):
+ *
+ *	vpn  = VA[31:12]			-- a *fixed* 12-bit shift in
+ *						   hardware, NOT PAGE_SHIFT
+ *	hash = vpn ^ (vpn >> HASH_SHIFT)	-- HASH_MODE=1
+ *	slot = (hash & ((1 << TSB_SIZE_LOG) - 1)) << 4
+ *
+ * with HASH_SHIFT == TSB_SIZE_LOG == JCORE_BOOT_TSB_SIZE_LOG, as
+ * programmed once by jcore_mmu_enable (arch/sh/kernel/cpu/jcore/
+ * mmu_enable.S) and never rewritten.
+ *
+ * Note the 12 is deliberate and is not a PAGE_SHIFT bug: hardware hashes
+ * 4 KB-granular page numbers regardless of the kernel's 16 KB base page
+ * size, so the four 4 KB-granular VAs inside one 16 KB page can hash to
+ * four different slots. That only ever costs a fast-path miss (the slot
+ * tags are still compared), never a wrong translation -- the TSB is a
+ * hint cache, not an authority.
+ */
+static inline unsigned long jcore_tsb_slot_offset(unsigned long addr)
+{
+	unsigned long vpn = addr >> 12;
+	unsigned long hash = vpn ^ (vpn >> JCORE_BOOT_TSB_SIZE_LOG);
+
+	return (hash & ((1UL << JCORE_BOOT_TSB_SIZE_LOG) - 1)) << 4;
+}
+
+/*
  * __update_tlb() - proactively prime the TLB/TSB for a freshly-faulted-in
  * pte (called from update_mmu_cache() right after the generic fault
  * handler installs the pte). Not strictly required for correctness (the
  * next access would just retake a TLB miss and __jcore_tlb_walk() would
  * populate it lazily), but avoids that guaranteed extra trap.
+ *
+ * The TSB slot is rewritten here as well as the hardware TLB entry. If
+ * only the TLB were primed, the (single, global, flush-surviving) TSB
+ * would keep whatever stale PTEL a previous walk left for this VPN, and
+ * the very next hardware-TLB flush would resurrect it -- the exact
+ * divergence local_flush_tlb_all() below now also guards against. Prime
+ * both or neither; never one.
  */
 void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 {
-	unsigned long flags, pteh, ptel;
+	unsigned long flags, pteh, ptel, asid_tag, tsb_slot;
 
 	/* Handle debugger faulting in the debuggee. */
 	if (vma && current->active_mm != vma->vm_mm)
@@ -153,12 +191,50 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 		"ldtlb.rn"
 		: : "r" (pteh), "r" (ptel) : "memory");
 
+	/*
+	 * Mirror the TLB entry into the TSB slot the fast path would probe
+	 * for this VPN, with the same three-word layout __jcore_tlb_walk()
+	 * writes (tag_hi = VPN, tag_lo = ASID_TAG, data = PTEL).
+	 */
+	__asm__ __volatile__("stc asidr, %0" : "=r" (asid_tag));
+	tsb_slot = (unsigned long)jcore_boot_tsb +
+		   jcore_tsb_slot_offset(address);
+	*(unsigned long *)(tsb_slot + 0) = pteh;	/* tag_hi */
+	*(unsigned long *)(tsb_slot + 4) = asid_tag;	/* tag_lo */
+	*(unsigned long *)(tsb_slot + 8) = ptel;	/* data   */
+
 	local_irq_restore(flags);
 }
 
 /*
  * local_flush_tlb_all() - MMUCR.TI is a self-clearing write-1 strobe that
  * invalidates every TLB entry (hardware-spec.md §2.3).
+ *
+ * MMUCR.TI reaches the *hardware* TLB only. The software TSB
+ * (jcore_boot_tsb) is a second, independent translation cache that the
+ * fast path in arch/sh/kernel/cpu/jcore/ex.S trusts on a miss and
+ * reinstalls with LDTLB.RN without re-consulting the page table. A TSB
+ * slot that survived a flush is therefore not a stale hint but a stale
+ * *translation*: write-protecting a pte and flushing (fork()/COW,
+ * mprotect(), dirty tracking) would leave the pre-flush W=1 slot live and
+ * the next write would silently succeed against the now-shared page. It
+ * also strands the fast path in a protection-fault livelock once the
+ * walker starts withholding PTEL.W from clean ptes. So invalidate both
+ * caches here, together, always.
+ *
+ * A full memset() rather than a targeted slot invalidate: the boot TSB is
+ * 4 KB (JCORE_BOOT_TSB_BYTES), local_flush_tlb_one() has no single-entry
+ * hardware primitive to pair with anyway and funnels straight here, and a
+ * flush must never be cheaper than correct.
+ *
+ * SMP scope: this is the *local* flush, and the memset() is deliberately
+ * held to the same local-only discipline as
+ * jcore_tsb_flush_on_generation() below -- see the SMP-scope paragraph in
+ * that function's comment. Single-core correctness is exact; a second CPU
+ * concurrently walking the shared boot TSB while this memset() runs is
+ * the same known hazard documented there, to be fixed at the same
+ * cross-CPU broadcast point (flush_tlb_all()), not with an ad hoc IPI
+ * here.
  */
 void local_flush_tlb_all(void)
 {
@@ -170,6 +246,13 @@ void local_flush_tlb_all(void)
 	status = __raw_readl(MMUCR);
 	status |= MMUCR_TI;
 	__raw_writel(status, MMUCR);
+	/*
+	 * After the hardware strobe, and with interrupts off, so nothing on
+	 * this CPU can re-populate a slot in between. jcore_boot_tsb lives
+	 * in kernel BSS (P1, untranslated), so the memset() itself cannot
+	 * recurse into a TLB miss.
+	 */
+	memset(jcore_boot_tsb, 0, JCORE_BOOT_TSB_BYTES);
 	local_irq_restore(flags);
 }
 

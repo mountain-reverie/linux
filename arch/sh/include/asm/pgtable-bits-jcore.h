@@ -151,6 +151,21 @@ static inline unsigned long jcore_pte_to_ptel(unsigned long pte_val)
 	unsigned long pagemask = (unsigned long)jcore_pm_for_slot[jcore_pte_size_slot(pte_val)]
 				 << _PAGE_JCORE_PAGEMASK_SHIFT;
 
+	/*
+	 * Withhold PTEL.W (write permission) on clean pages to trap the first
+	 * write. J-Core hardware does not set PTEL.D, so without this guard,
+	 * clean writable pages install writable, the first write never traps,
+	 * and _PAGE_DIRTY is never set -- causing data loss in writeback-managed
+	 * mappings. SH-4 solves this with a hardware initial-page-write exception.
+	 * J-Core has none, so we instead trap via DPROT_W, and the handler
+	 * (FAULT_CODE_WRITE + FAULT_FLAG_WRITE in do_page_fault) sets _PAGE_DIRTY
+	 * via generic mm, which then re-faults with write permission granted. This
+	 * applies only to user mappings; PAGE_KERNEL includes _PAGE_DIRTY, so
+	 * kernel mappings install writable and take no extra faults on the direct map.
+	 */
+	if (!(pte_val & _PAGE_DIRTY))
+		hwbits &= ~_PAGE_WRITE;
+
 	return ppn | pagemask | hwbits;
 }
 #endif /* !__ASSEMBLY__ */

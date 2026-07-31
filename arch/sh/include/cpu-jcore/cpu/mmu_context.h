@@ -11,6 +11,7 @@
 
 #define MMU_TTB		0xFF000008	/* Translation table base (SW scratch, HW ignores) */
 #define MMU_TEA		0xFF00000C	/* TLB Exception Address */
+#define MMU_FSR	0xFF000028	/* TLB Fault Status (direction/cause; read-only) */
 
 #define MMUCR		0xFF000010	/* MMU Control Register */
 
