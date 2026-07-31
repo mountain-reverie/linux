@@ -7,8 +7,10 @@
  * Like SH-3/SH-4, J4 delivers ALL TLB faults to a single hardware-fixed
  * vector, VBR + 0x400 (I/D, miss/protection alike; see the
  * mmu-m3-vector-decision project note and docs/mmu/design-spec.md). The
- * six causes are still distinguishable via EXPEVT on the slow path, but
- * the hot path never needs to: by the time it fires, hardware has already
+ * causes are distinguishable on the slow path -- EXPEVT separates five of
+ * the six, and MMUFSR (0xFF000028) supplies the DPROT_R/DPROT_W direction
+ * EXPEVT collapses, which is what do_page_fault() reads -- but the hot
+ * path never needs to: by the time it fires, hardware has already
  * loaded PTEH/ASIDR/TSBPTR for the faulting access, so there is nothing
  * left to distinguish. (An earlier SP0 layout gave each access type its
  * own vector -- 0x400/0x420/0x440 -- but the handler is byte-identical for

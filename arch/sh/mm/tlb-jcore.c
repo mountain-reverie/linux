@@ -6,8 +6,8 @@
  *
  * The J4 MMU has no hardware page-table walker: on a TLB miss the CPU
  * loads PTEH (faulting VPN)/ASIDR (current ASID_TAG)/TSBPTR (precomputed
- * TSB slot) and jumps to a fixed vector (VBR + 0x400/0x420/0x440, see
- * arch/sh/kernel/cpu/jcore/{tlbmiss.S,ex.S}). The hot path there probes
+ * TSB slot) and jumps to the single TLB vector (VBR + 0x400, shared by all
+ * six causes, see arch/sh/kernel/cpu/jcore/ex.S). The hot path there probes
  * the two-word TSB tag directly; __jcore_tlb_walk() below is the slow
  * path it falls back to on a TSB miss, walking the real Linux page
  * table and re-populating both PTEL and the TSB slot for next time
