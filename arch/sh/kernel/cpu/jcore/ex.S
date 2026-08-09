@@ -4,17 +4,18 @@
  *
  * J-Core J4 fixed TLB-miss vectors + software TLB-miss handler.
  *
- * Like SH-3/SH-4, J4 delivers ALL TLB faults to a single hardware-fixed
- * vector, VBR + 0x400 (I/D, miss/protection alike; see the
- * mmu-m3-vector-decision project note and docs/mmu/design-spec.md). The
- * causes are distinguishable on the slow path -- EXPEVT separates five of
- * the six, and MMUFSR (0xFF000028) supplies the DPROT_R/DPROT_W direction
- * EXPEVT collapses, which is what do_page_fault() reads -- but the hot
- * path never needs to: by the time it fires, hardware has already
- * loaded PTEH/ASIDR/TSBPTR for the faulting access, so there is nothing
- * left to distinguish. (An earlier SP0 layout gave each access type its
- * own vector -- 0x400/0x420/0x440 -- but the handler is byte-identical for
- * all three, so that only triplicated the hot-path I-cache footprint.)
+ * Like SH-3/SH-4, J4 delivers the three TLB MISS causes (IMISS, DMISS_R,
+ * DMISS_W) to one hardware-fixed vector, VBR + 0x400. PROTECTION faults
+ * (IPROT, DPROT_R, DPROT_W) go to VBR + 0x100 instead -- which is what SH-4
+ * itself does (SH7750 hardware manual Rev 2.0 02/99: misses H'400, protection
+ * H'100), and what J4 now does after the vectors were split.
+ *
+ * That split is why this file no longer tests EXPEVT on the hot path. While
+ * all six causes shared 0x400, a protection fault against a VPN/ASID with a
+ * still-valid TSB entry would TSB-hit here, and reinstalling that entry
+ * livelocks -- do_page_fault() never runs to repair the pte. The fast path had
+ * to check the cause on EVERY hit to avoid it. With protection vectored
+ * elsewhere the hazard is excluded by construction, and the check is gone.
  *
  * Rather than have the vector *jump* to a common routine -- which would
  * cost a literal load + taken branch + delay slot on every single TLB
@@ -65,31 +66,11 @@
  * description of this size, including this one -- it has been wrong
  * twice already).
  *
- * PROTECTION FAULTS: because all six TLB causes share this one vector,
- * a *protection* fault (EXPEVT 0x0A0 IPROT, 0x0C0 DPROT_R/W) against a
- * VPN/ASID that already has a valid TSB slot also TSB-hits here. Simply
- * running LDTLB.RN would reinstall the identical (e.g. read-only)
- * entry and let the faulting instruction retry -- an infinite livelock,
- * since do_page_fault() is never reached to fix the pte up. So on a TSB
- * hit we additionally check EXPEVT and divert protection faults to
- * jcore_tlb_fastpath_prot (which hands off to the real do_page_fault()
- * tail) instead of falling through to LDTLB.RN.
- *
- * EXPEVT is read in-core (`stc expevt, r2`) rather than via the P4 MMIO
- * alias: this is the hottest path in the kernel and an uncached P4 read
- * here would cost tens of cycles for no reason. The mnemonic needs a
- * J4-aware assembler (mountain-reverie/binutils-gdb, branch jcore) and
- * -Wa,-isa=sh-jcore, which arch/sh/Makefile already passes for
- * CONFIG_CPU_SUBTYPE_JCORE via as-option.
- *
- * The EXPEVT>=0x0A0 test avoids 'mov #imm,Rn' sign-extension pitfalls
- * (mov #0xA0,rN would yield 0xFFFFFFA0, not 0xA0) by first subtracting
- * 128 (0x80, representable directly as an 8-bit signed immediate) and
- * then testing strictly-positive with CMP/PL: EXPEVT-128 > 0 iff
- * EXPEVT > 0x80 iff EXPEVT is IPROT/DPROT_R/DPROT_W (0x0A0 or 0x0C0);
- * EXPEVT-128 <= 0 for IMISS/DMISS_R/DMISS_W (0x040/0x060/0x080). The
- * known EXPEVT lossiness (DPROT_R vs DPROT_W both read back 0x0C0)
- * does not matter here since both are protection faults.
+ * Uses only bank-1 scratch (r0, r1, r3) and no literal pool, so the whole
+ * macro is 9 insns = 18 bytes -- well inside the 0x20 vector budget, which the
+ * '.org jcore_vec_tlb + 0x20' assertion after its expansion enforces (recount
+ * before trusting any prose description of this size, including this one -- it
+ * has been wrong twice already).
  */
 	.macro	JCORE_TLB_FASTPATH
 	stc	tsbptr, r0
@@ -105,58 +86,48 @@
 					 * Harmless on a miss (r3 is scratch). */
 	cmp/eq	asidr, r1		/* ASID_TAG match? -- fused compare */
 	bf	jcore_tlb_miss_slow
-	stc	expevt, r2		/* r2 = EXPEVT (0x0252) */
-	add	#-128, r2		/* r2 = EXPEVT - 0x80 */
-	cmp/pl	r2			/* T = (EXPEVT > 0x80), i.e. a protection
-					 * fault (0x0A0/0x0C0) rather than a miss
-					 * (0x040/0x060/0x080) */
-	bt	jcore_tlb_fastpath_prot
 	ldtlb.rn r3			/* PTEL<-r3 (loaded 4 insns ago) + install + return
 					 * in one insn -- fused LDC+LDTLB.RN. Slow path
 					 * still uses plain ldtlb.rn (walker sets PTEL CSR). */
 	.endm
 
 !
-! J4 generic exception dispatch (byte-identical to sh2/ex.S's vbr_base,
-! duplicated here -- not shared -- because it must sit immediately
-! before the fixed TLB-miss vectors within this one object file so the
-! linker cannot interpose other code between the table and the vectors).
+! J4 Exception Vector Page -- VBR points here (per_cpu_trap_init, traps_32.c).
 !
-jcore_exception_entry:
-no	=	0
-	.rept	256
-	mov.l	r1,@-sp
-	bra	jcore_exception_trampoline
-	mov	#no,r1
-no	=	no + 1
-	.endr
-jcore_exception_trampoline:
-	mov.l	r0,@-sp
-	mov.l	$jcore_exception_handler,r0
-	extu.b	r1,r1
-	jmp	@r0
-	  extu.w	r1,r1
-
-	.align	2
-$jcore_exception_entry:
-	.long	jcore_exception_entry
-$jcore_exception_handler:
-	.long	exception_handler
+! J4 uses SH-4-style FIXED vectors: hardware branches to VBR+offset as CODE.
+! This used to be a 256-entry POINTER table (sh2/ex.S's vbr_base layout) whose
+! entries fed sh2/entry.S's exception_handler -- correct for SH-2's
+! table-driven vectoring and stack-pushed PC/SR, but J4 has neither. VBR+0x100
+! and VBR+0x600 were therefore *executing .long values as instructions*; only
+! VBR+0x400 was ever right, because it is the only one CI exercised. The table
+! is gone and each vector now holds real code.
 !
-! J4 Exception Vector Base -- VBR is pointed here (not at sh2/ex.S's
-! vbr_base) for CONFIG_CPU_JCORE; see per_cpu_trap_init() (traps_32.c).
-! Must itself be 0x20-aligned so the 0x400-byte generic-exception table
-! below places the inlined TLB fast path at exactly +0x400 relative to
-! this symbol (not just some arbitrary boundary).
+!   +0x000  not a J4 vector -- trap loudly rather than run into 0x100
+!   +0x100  Error / Slot Illegal / General Illegal / TRAPA, and (since the
+!           miss/protection split) IPROT + DPROT_R/W. EXPEVT discriminates.
+!   +0x400  all three TLB MISS causes; fast path inlined, not jumped to
+!   +0x600  interrupts; INTEVT carries the source
+!
+! Guard: mmulinuxexc drives +0x100 and +0x600 through these; mmulinux covers
+! +0x400.
 !
 	.balign	0x20
 ENTRY(jcore_vbr_base)
-vector	=	0
-	.rept	256
-	.long	jcore_exception_entry + vector * 6
-vector	=	vector + 1
-	.endr
-! --- exactly 0x400 bytes above this point; do not insert an .align ---
+	! VBR+0x000 is not a J4 vector. Landing here means VBR is wrong or a
+	! vector offset is; spin rather than fall through into +0x100 and
+	! mis-handle it as a general exception.
+0:	bra	0b
+	 nop
+
+	.org	jcore_vbr_base + 0x100
+ENTRY(jcore_vec_general)
+	mov.l	9f, r0
+	jmp	@r0
+	 nop
+	.align	4
+9:	.long	jcore_general_entry
+
+	.org	jcore_vbr_base + 0x400
 ENTRY(jcore_vec_tlb)			/* VBR + 0x400: ALL TLB faults (I/D, miss/prot) */
 ENTRY(jcore_tlb_miss)			/* alias: SP2 bare-metal harness entry */
 	JCORE_TLB_FASTPATH
@@ -175,29 +146,31 @@ ENTRY(jcore_tlb_miss)			/* alias: SP2 bare-metal harness entry */
 	! unconditionally, pass or fail. '.org' has no such restriction --
 	! it errors iff the location counter has already moved past the
 	! target when reached, which is exactly the assert we want.
+	! EXACT-SIZE assert -- this is the one that catches BF relaxation.
+	! The fast path is 9 instructions = 0x12 bytes. If `bf jcore_tlb_miss_slow`
+	! ever falls outside BF's +/-256-byte reach, gas silently rewrites each one
+	! as `bt .+2; bra slow; nop`, which INVERTS the branch sense: a TSB hit --
+	! the case this macro exists to make branchless -- starts taking two taken
+	! branches. The 0x20 budget below CANNOT catch that: relaxed, the macro is
+	! 13 insns = 0x1A bytes, still under 0x20. It sailed through once already.
+	! .org errors iff the location counter is already past the target, so this
+	! fails the build the moment the macro grows by even one instruction.
+	.org	jcore_vec_tlb + 0x12
+
+	! Vector-stride budget (self-imposed, not a hardware stride) and the pad
+	! that places the slow path at a known offset.
 	.org	jcore_vec_tlb + 0x20
 
-!
-! Reached by BT from the inlined fast path above on a TSB hit whose
-! EXPEVT says protection fault, not miss. Unlike jcore_tlb_miss_slow's
-! jcore_tlb_real_fault, no r4-r7/PR save/restore is needed here: the
-! fast path above never touches PR or bank-1 r4-r7, so register state
-! already matches what jcore_tlb_fault_entry expects on entry (see its
-! header comment in entry.S). Hands off directly to the pt_regs-building
-! real-fault tail; do_page_fault() re-walks the page table and will
-! grant write access (setting _PAGE_DIRTY) if this was in fact a
-! copy-on-write/dirty-tracking fault rather than a true permission
-! violation -- routing through jcore_tlb_miss_slow's walker instead
-! would be pointless, since a page-table walk cannot fix up a
-! protection fault on an already-present, already-valid pte.
-!
-	.align	4
-jcore_tlb_fastpath_prot:
-	mov.l	5f, r0
-	jmp	@r0
-	 nop
-	.align	4
-5:	.long	jcore_tlb_fault_entry
+	! The slow path MUST live in the 0x420..0x600 gap, i.e. between the TLB
+	! vector and the interrupt vector -- NOT after 0x600. The fast path
+	! reaches it with BF, whose range is +/-256 bytes; push it past the
+	! interrupt vector and the assembler silently relaxes each `bf slow`
+	! into `bt .+2; bra slow; nop`. That inverts the branch sense, so a TSB
+	! HIT -- the case the whole macro is shaped around -- starts taking two
+	! taken branches instead of falling through. It costs cycles and nothing
+	! warns you; it was caught by disassembling the vector page, not by any
+	! test. The gap is 0x1E0 bytes and the slow path needs ~0x100, so it
+	! fits comfortably. Verify with objdump after touching this layout.
 
 !
 ! Shared slow path (one copy). Reached by BF from the inlined fast path
@@ -259,5 +232,13 @@ jcore_tlb_real_fault:
 4:	.long	jcore_tlb_fault_entry
 
 	.align	4
+	.org	jcore_vbr_base + 0x600
+ENTRY(jcore_vec_irq)
+	mov.l	8f, r0
+	jmp	@r0
+	 nop
+	.align	4
+8:	.long	jcore_irq_entry
+
 ENTRY(jcore_tlb_vectors)
 	.long	jcore_vec_tlb		/* VBR + 0x400: all TLB faults (I/D, miss/prot) */
