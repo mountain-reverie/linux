@@ -28,6 +28,10 @@
  * jcore_read_tsbptr() - read back the (unchanged) TSB set address the
  * hot path already computed. Kept as a one-line helper so
  * __jcore_tlb_walk() has no dependency beyond it and jcore_pte_to_ptel().
+ *
+ * The value is a kernel virtual (P1) address and may be dereferenced as
+ * one -- see the address-space note on jcore_tsb_slot_addr() below for
+ * why that is true and what keeps it true.
  */
 static inline unsigned long jcore_read_tsbptr(void)
 {
@@ -219,6 +223,45 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
  * page can land in four different slots. That only ever costs a
  * fast-path miss (the slot tags are still compared), never a wrong
  * translation -- the TSB is a hint cache, not an authority.
+ *
+ * ADDRESS SPACE -- why dereferencing this return value is correct.
+ *
+ * Both this helper and jcore_read_tsbptr() return
+ * `(TSBBR & ~0x1F) | (hash << 5)`: TSBBR's own bits [31:5] verbatim, with
+ * only the low index bits substituted. So whichever address space TSBBR
+ * is programmed in, that is the space the answer comes back in --
+ * hardware never converts.
+ *
+ * TSBBR is therefore programmed with the boot TSB's P1 KERNEL VIRTUAL
+ * address (arch/sh/kernel/head_32.S, .LJCORE_TSB_PHYS -> r4 ->
+ * jcore_mmu_enable()), NOT its physical address, and that is a deliberate
+ * contract with the RTL, not an accident:
+ *
+ *   - The hardware TSB walker fetches entries with its own bus master and
+ *     applies the SH P1 fold (PA = VA & 0x1FFFFFFF) to its own address
+ *     before driving it -- jcore-cpu core/cpu.vhd, g_dstore_squash, the
+ *     `walk_own` takeover arm, whose comment states outright that "every
+ *     TSBBR the guards and linux@jcore program is a P1 kernel address ...
+ *     which the software miss handler reads through the fold". Feed the
+ *     walker a bare PA instead and it is left unfolded and the entry is
+ *     fetched from the wrong place.
+ *   - Software gets a P1 address back, which is untranslated and cached
+ *     and so may be dereferenced directly -- here, in
+ *     jcore_tsb_pick_way(), in jcore_tsb_write_entry(), and in the
+ *     assembly fast path (arch/sh/kernel/cpu/jcore/ex.S), which loads
+ *     straight from STC TSBPTR with no conversion.
+ *
+ * A physical TSBBR would break BOTH ends. Software would be dereferencing
+ * e.g. 0x10001000, which is P0 and therefore TRANSLATED once MMUCR.AT is
+ * set: a translated access to an unrelated user VA, and inside the TLB
+ * vector (SR.BL=1) a miss on it is a double fault rather than a
+ * diagnostic. Nothing in the guard suite can catch that -- the SP2 cosim
+ * harness maps VA==PA -- which is exactly why the invariant is written
+ * down here instead of being left to a test.
+ *
+ * So: do NOT "fix" this by adding __va()/__pa() at this boundary. The
+ * conversion belongs at the single point where TSBBR is programmed, and
+ * it is already there.
  */
 static inline unsigned long jcore_tsb_slot_addr(unsigned long addr)
 {

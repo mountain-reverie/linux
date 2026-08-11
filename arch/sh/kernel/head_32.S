@@ -306,7 +306,7 @@ ENTRY(_stext)
  *   1. Program TSBBR (TSB base [31:N+5] | TSB_SIZE_LOG [3:0], counting
  *      32-byte 2-way SETS) to point
  *      at the BSS-resident boot TSB (jcore_boot_tsb, probe.c), which is
- *      aligned to its own size so the physical address's low bits are
+ *      aligned to its own size so the base address's low bits are
  *      already zero and TSB_SIZE_LOG can just be OR'd in.
  *   2. Program TSBCFG (HASH_MODE=1, HASH_SHIFT=TSB_SIZE_LOG) so
  *      hardware's XOR-fold hash is well spread from the very first
@@ -323,11 +323,41 @@ ENTRY(_stext)
  * The actual TSBBR/TSBCFG/ASIDR/PTEH/MMUCR programming sequence lives
  * in jcore_mmu_enable() (arch/sh/kernel/cpu/jcore/mmu_enable.S) so that
  * the real boot path and the SP3 cosim harness share byte-identical
- * code. We only compute the boot-TSB physical address here (it needs
- * PAGE_OFFSET/__MEMORY_START relocation, which a cosim harness doesn't
- * have) and pass it in r4 per jcore_mmu_enable's input contract.
+ * code. We only supply the boot-TSB base address here and pass it in r4
+ * per jcore_mmu_enable's input contract.
+ *
+ * THE BASE HANDED TO TSBBR IS A P1 KERNEL VIRTUAL ADDRESS, NOT A PHYSICAL
+ * ONE. That is the contract with the RTL, and it is load-bearing at both
+ * ends:
+ *
+ *   - Hardware: the TSB walker drives its own bus master and applies the
+ *     SH P1 fold (PA = VA & 0x1FFFFFFF) to the address it derived from
+ *     TSBBR before putting it on the bus -- jcore-cpu core/cpu.vhd,
+ *     g_dstore_squash, the `walk_own` takeover arm. A bare PA is left
+ *     unfolded and the walker reads the wrong place.
+ *   - Software: TSBPTR and the JCORE_TSB_SLOT helper return TSBBR's own
+ *     bits [31:5] with only the index substituted, so they hand software
+ *     back whatever space TSBBR is in. P1 is untranslated and cached and
+ *     may be dereferenced directly, which is what arch/sh/mm/tlb-jcore.c
+ *     and the ex.S fast path do. A physical TSBBR would make those
+ *     dereferences land in P0 -- TRANSLATED with AT=1, and inside the TLB
+ *     vector (SR.BL=1) a miss on it is a double fault.
+ *
+ * jcore_boot_tsb's link address IS its P1 address: vmlinux.lds.S links at
+ * PAGE_OFFSET + __MEMORY_START = 0x80000000 + 0x10000000 = 0x90000000,
+ * inside P1 (0x80000000-0x9FFFFFFF). So the symbol is passed as-is, with
+ * no relocation at all.
+ *
+ * This used to read `jcore_boot_tsb - PAGE_OFFSET + __MEMORY_START`,
+ * which was wrong twice over: it handed hardware a physical address (the
+ * defect above) and it double-counted __MEMORY_START while doing so,
+ * since __MEMORY_START is already inside the symbol's link address
+ * (0x90001000 -> 0x20001000, not even the right PA). Nothing caught it:
+ * the cosim harness calls jcore_mmu_enable() with its own r4 -- a P1
+ * address, matching the corrected contract -- and never evaluates this
+ * expression at all.
  */
-	mov.l	.LJCORE_TSB_PHYS, r4
+	mov.l	.LJCORE_TSB_BASE, r4
 	mov.l	.LJCORE_MMU_ENABLE, r0
 	jsr	@r0
 	 nop
@@ -336,7 +366,7 @@ ENTRY(_stext)
 
 	.balign 4
 .LJCORE_MMU_ENABLE:	.long	jcore_mmu_enable
-.LJCORE_TSB_PHYS:	.long	jcore_boot_tsb - PAGE_OFFSET + __MEMORY_START
+.LJCORE_TSB_BASE:	.long	jcore_boot_tsb	/* P1 kernel VA -- see above */
 .Ljcore_mmu_done:
 #endif /* CONFIG_CPU_JCORE */
 
