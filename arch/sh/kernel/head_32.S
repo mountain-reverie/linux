@@ -303,7 +303,8 @@ ENTRY(_stext)
  * boot TSB below are safe both before and after we flip AT.
  *
  * Sequence (linux-spec.md §11, hardware-spec.md §2.6/§2.7/§2.3):
- *   1. Program TSBBR (TSB base [31:N+4] | TSB_SIZE_LOG [3:0]) to point
+ *   1. Program TSBBR (TSB base [31:N+5] | TSB_SIZE_LOG [3:0], counting
+ *      32-byte 2-way SETS) to point
  *      at the BSS-resident boot TSB (jcore_boot_tsb, probe.c), which is
  *      aligned to its own size so the physical address's low bits are
  *      already zero and TSB_SIZE_LOG can just be OR'd in.

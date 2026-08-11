@@ -25,7 +25,7 @@
 #include <cpu/mmu_context.h>
 
 /*
- * jcore_read_tsbptr() - read back the (unchanged) TSB slot address the
+ * jcore_read_tsbptr() - read back the (unchanged) TSB set address the
  * hot path already computed. Kept as a one-line helper so
  * __jcore_tlb_walk() has no dependency beyond it and jcore_pte_to_ptel().
  */
@@ -39,7 +39,7 @@ static inline unsigned long jcore_read_tsbptr(void)
 
 /*
  * jcore_tsb_write_entry() - the ONLY place that stores the three words of
- * a TSB slot.
+ * a TSB entry.
  *
  * Commit order matters: the hardware TSB walker (core/tlb_walk.vhd)
  * compares tag_hi FIRST, then tag_lo, and only then reads data and
@@ -59,20 +59,59 @@ static inline unsigned long jcore_read_tsbptr(void)
  * the reasoning right in front of them, instead of being able to
  * open-code a fourth, unreviewed store site.
  *
- * @slot:     byte address of the 3-word (12-byte) TSB entry.
+ * @set:      byte address of the 32-byte, 2-way TSB SET (from TSBPTR or
+ *            JCORE_TSB_SLOT -- hardware now returns a set, not an entry).
+ * @way:      which way of the set to write; see jcore_tsb_pick_way().
  * @vpn:      tag_hi -- the faulting VPN (page-aligned address).
  * @asid_tag: tag_lo -- the ASID_TAG this entry is valid for.
  * @ptel:     data -- the hardware PTEL image.
  */
-static inline void jcore_tsb_write_entry(unsigned long slot,
+static inline void jcore_tsb_write_entry(unsigned long set,
+					  unsigned int way,
 					  unsigned long vpn,
 					  unsigned long asid_tag,
 					  unsigned long ptel)
 {
+	unsigned long slot = set + way * JCORE_TSB_ENTRY_BYTES;
+
 	*(unsigned long *)(slot + 8) = ptel;		/* data   (PTEL)      */
 	*(unsigned long *)(slot + 4) = asid_tag;	/* tag_lo (ASID_TAG)  */
 	barrier();
 	*(unsigned long *)(slot + 0) = vpn;		/* tag_hi -- commit point */
+}
+
+/*
+ * jcore_tsb_pick_way() - choose which way of @set to write for @vpn.
+ *
+ * The rule is: if either way already holds this VPN, OVERWRITE THAT WAY.
+ * Only when neither matches do we take the hardware's victim nomination.
+ *
+ * This is not an optimisation and must not be "optimised" into always
+ * taking the victim. Overwriting the matching way is what makes a stale
+ * duplicate of a VPN unconstructable. Suppose a fresh entry for VPN X went
+ * to way 1 while a stale entry for the same X still sat in way 0: the next
+ * walk probes way 0 first, matches its tag, and installs the STALE PTEL --
+ * wrong permissions, no exception, no diagnostic. Hardware cannot detect
+ * that; the tags are both legitimate. One index function plus both ways in
+ * a single 32-byte line is precisely what lets software rule it out here,
+ * for the cost of one extra load it has already paid for (the set is one
+ * cache line).
+ *
+ * The victim nomination comes from a hardware LFSR seeded by the OS at
+ * init (jcore_tsb_victim_seed_init(), arch/sh/kernel/cpu/jcore/probe.c);
+ * see JCORE_TSB_VICTIM.
+ */
+static inline unsigned int jcore_tsb_pick_way(unsigned long set,
+					      unsigned long vpn)
+{
+	const unsigned long *tags = (const unsigned long *)set;
+	unsigned int way;
+
+	for (way = 0; way < JCORE_TSB_WAYS; way++)
+		if (tags[way * (JCORE_TSB_ENTRY_BYTES / sizeof(long))] == vpn)
+			return way;
+
+	return __raw_readl(JCORE_TSB_VICTIM) & (JCORE_TSB_WAYS - 1);
 }
 
 /*
@@ -104,8 +143,9 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  *
  * On success: sets the software _PAGE_ACCESSED bit if unset, builds the
  * hardware PTEL image via jcore_pte_to_ptel(), loads it into PTEL, and
- * rewrites the 3-word TSB slot (tag_hi = VPN, tag_lo = ASID_TAG,
- * data = PTEL) so the next miss to this VPN/ASID hits the fast path.
+ * rewrites one way of the 32-byte TSB set (tag_hi = VPN,
+ * tag_lo = ASID_TAG, data = PTEL) so the next miss to this VPN/ASID hits
+ * the fast path.
  * Returns 0 and expects the caller (tlbmiss.S) to execute LDTLB.RN.
  *
  * On failure (not present, or software PROTNONE/STALE marker set):
@@ -119,7 +159,7 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 	pte_t *ptep;
 	pte_t entry;
 	unsigned long ptel;
-	unsigned long tsb_slot;
+	unsigned long tsb_set;
 	unsigned long vpn;
 
 	pgd += pgd_index(addr);
@@ -157,14 +197,15 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 	__asm__ __volatile__("ldc %0, ptel" : : "r" (ptel));
 
 	vpn = addr & PAGE_MASK;
-	tsb_slot = jcore_read_tsbptr();
-	jcore_tsb_write_entry(tsb_slot, vpn, pteh_tag, ptel);
+	tsb_set = jcore_read_tsbptr();
+	jcore_tsb_write_entry(tsb_set, jcore_tsb_pick_way(tsb_set, vpn),
+			      vpn, pteh_tag, ptel);
 
 	return 0;
 }
 
 /*
- * jcore_tsb_slot_addr() - the TSB slot address hardware would compute for
+ * jcore_tsb_slot_addr() - the TSB SET address hardware would compute for
  * a fault at @addr, via the JCORE_TSB_SLOT MMIO helper (write VA, read
  * slot address; see its definition in cpu/mmu_context.h). This used to be
  * jcore_tsb_slot_offset(), a from-scratch C reimplementation of the RTL's
@@ -201,7 +242,7 @@ static inline unsigned long jcore_tsb_slot_addr(unsigned long addr)
  */
 void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 {
-	unsigned long flags, pteh, ptel, asid_tag, tsb_slot;
+	unsigned long flags, pteh, ptel, asid_tag, tsb_set;
 
 	/* Handle debugger faulting in the debuggee. */
 	if (vma && current->active_mm != vma->vm_mm)
@@ -219,13 +260,17 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 		: : "r" (pteh), "r" (ptel) : "memory");
 
 	/*
-	 * Mirror the TLB entry into the TSB slot the fast path would probe
-	 * for this VPN, with the same three-word layout __jcore_tlb_walk()
-	 * writes (tag_hi = VPN, tag_lo = ASID_TAG, data = PTEL).
+	 * Mirror the TLB entry into the TSB set the walker would probe for
+	 * this VPN, with the same three-word layout __jcore_tlb_walk()
+	 * writes (tag_hi = VPN, tag_lo = ASID_TAG, data = PTEL), into the
+	 * way jcore_tsb_pick_way() selects -- the MATCHING way if this VPN
+	 * is already present, so this cannot leave a stale duplicate of it
+	 * in the other way.
 	 */
 	__asm__ __volatile__("stc asidr, %0" : "=r" (asid_tag));
-	tsb_slot = jcore_tsb_slot_addr(address);
-	jcore_tsb_write_entry(tsb_slot, pteh, asid_tag, ptel);
+	tsb_set = jcore_tsb_slot_addr(address);
+	jcore_tsb_write_entry(tsb_set, jcore_tsb_pick_way(tsb_set, pteh),
+			      pteh, asid_tag, ptel);
 
 	local_irq_restore(flags);
 }
@@ -247,7 +292,8 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
  * caches here, together, always.
  *
  * A full memset() rather than a targeted slot invalidate: the boot TSB is
- * 4 KB (JCORE_BOOT_TSB_BYTES), local_flush_tlb_one() has no single-entry
+ * 8 KB (JCORE_BOOT_TSB_BYTES: 256 sets x 32 bytes), local_flush_tlb_one()
+ * has no single-entry
  * hardware primitive to pair with anyway and funnels straight here, and a
  * flush must never be cheaper than correct.
  *

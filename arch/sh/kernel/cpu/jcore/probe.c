@@ -13,6 +13,7 @@
  */
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/random.h>
 #include <asm/processor.h>
 #include <asm/cache.h>
 #include <cpu/mmu_context.h>
@@ -22,11 +23,41 @@
 
 /*
  * Boot TSB (head_32.S's JCORE MMU-enable arm programs TSBBR/TSBCFG to
- * point here before setting MMUCR.AT). Lives in BSS, 4KB-aligned so
- * head_32.S can just OR TSB_SIZE_LOG into the low bits of its physical
- * address without any masking (hardware-spec.md §2.6).
+ * point here before setting MMUCR.AT). Lives in BSS, aligned to its own
+ * size (8 KB = 256 32-byte 2-way sets) so head_32.S can just OR
+ * TSB_SIZE_LOG into the low bits of its physical address without any
+ * masking (hardware-spec.md §2.6).
  */
 char jcore_boot_tsb[JCORE_BOOT_TSB_BYTES] __aligned(JCORE_BOOT_TSB_BYTES);
+
+/*
+ * jcore_tsb_victim_seed_init() - hand the hardware TSB victim selector its
+ * seed.
+ *
+ * The LFSR that nominates which way of a 2-way TSB set to replace has NO
+ * seed of its own. That is deliberate: this is an open-source core, so a
+ * constant compiled into the RTL would be published along with the
+ * polynomial, and anyone could compute the eviction sequence offline.
+ * Seeding it from the kernel RNG is what makes the sequence unavailable to
+ * anyone who cannot already read kernel memory.
+ *
+ * JCORE_TSB_VSEED is write-only in hardware, and the seed is never read
+ * back here -- it leaves this function and becomes unobservable.
+ *
+ * This lives here, not in arch/sh/mm/tlb-jcore.c, on purpose: the jcore-cpu
+ * bare-metal cosim harnesses (sim/linux_sim.sh) link tlb-jcore.o directly
+ * and would then need a get_random_u32() stub. probe.o is not in that link.
+ *
+ * An unseeded selector is not a correctness problem -- hardware self-heals
+ * its all-zero LFSR state to a fixed constant, so both ways are still used,
+ * just predictably until this initcall runs.
+ */
+static int __init jcore_tsb_victim_seed_init(void)
+{
+	__raw_writel(get_random_u32(), (void __iomem *)JCORE_TSB_VSEED);
+	return 0;
+}
+early_initcall(jcore_tsb_victim_seed_init);
 
 void __ref cpu_probe(void)
 {

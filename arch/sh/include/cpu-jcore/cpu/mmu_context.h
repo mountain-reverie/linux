@@ -34,6 +34,32 @@
  */
 #define JCORE_TSB_SLOT	0xFF000048
 
+/*
+ * TSB victim selector (jcore-cpu Phase-2 Task 4, core/datapath.vhm
+ * P4_TSBVSEED / P4_TSBVICT).
+ *
+ * JCORE_TSB_VSEED is WRITE-ONLY. It seeds the hardware LFSR that nominates
+ * which way of a 2-way TSB set to replace when neither way's tag matches.
+ * The seed comes from the OS precisely because it must NOT be public: this
+ * is an open-source core, so the polynomial and any constant seed compiled
+ * into the RTL are readable by anyone, and a victim sequence an attacker can
+ * replay offline is worth no more than a fixed choice. Reading the register
+ * back returns a hard zero -- if software could recover the seed, so could
+ * an attacker.
+ *
+ * JCORE_TSB_VICTIM is READ-ONLY and exposes ONLY the 1-bit way nomination.
+ * Each read advances the LFSR one step, so nothing beyond the bits actually
+ * consumed is observable. Neither the seed nor the LFSR state is readable.
+ */
+#define JCORE_TSB_VSEED		0xFF00004C
+#define JCORE_TSB_VICTIM	0xFF000050
+
+/* Ways per TSB set (core/tlb_walk.vhd `tsb_ways`). */
+#define JCORE_TSB_WAYS		2
+/* Bytes per TSB entry; a set is JCORE_TSB_WAYS * JCORE_TSB_ENTRY_BYTES. */
+#define JCORE_TSB_ENTRY_BYTES	16
+#define JCORE_TSB_SET_BYTES	(JCORE_TSB_WAYS * JCORE_TSB_ENTRY_BYTES)
+
 /* MMUCR bit layout (hardware-spec.md §2.3) */
 #define MMUCR_AT	(1 << 0)	/* Address Translation enable */
 #define MMUCR_TI	(1 << 2)	/* TLB flush strobe (write-1) */
@@ -52,14 +78,18 @@
 
 /*
  * Boot TSB sizing (hardware-spec.md §2.6: TSB_SIZE_LOG valid range is
- * 6-14, each entry is 16 bytes). SP1 boot needs only a small early TSB
- * to get translation on; SP2/SP3 per-CPU TSBs (linux-spec.md §6.2) are
- * sized/allocated separately at CPU-up time. 256 entries (log2=8) is
- * 4096 bytes -- one 16KB page's worth of PTEs' hash spread, plenty for
- * the boot CPU's early miss traffic before proper per-mm TSBs exist.
+ * 6-14). SP1 boot needs only a small early TSB to get translation on;
+ * SP2/SP3 per-CPU TSBs (linux-spec.md §6.2) are sized/allocated
+ * separately at CPU-up time. 256 SETS (log2=8) is 8192 bytes.
+ *
+ * NOTE TSB_SIZE_LOG counts SETS, not entries: hardware's tsb_ptr() returns
+ * a 32-byte-aligned SET address (base | idx << 5), so the region is
+ * JCORE_TSB_SET_BYTES << TSB_SIZE_LOG. Sizing this as 16 << SIZE_LOG would
+ * allocate exactly half the region hardware indexes and let the top half of
+ * the hash range walk off the end of the object.
  */
 #define JCORE_BOOT_TSB_SIZE_LOG	8
-#define JCORE_BOOT_TSB_BYTES	(16 << JCORE_BOOT_TSB_SIZE_LOG)
+#define JCORE_BOOT_TSB_BYTES	(JCORE_TSB_SET_BYTES << JCORE_BOOT_TSB_SIZE_LOG)
 
 #ifndef __ASSEMBLY__
 /* Defined in arch/sh/kernel/cpu/jcore/probe.c; consumed by tlb-jcore.c to

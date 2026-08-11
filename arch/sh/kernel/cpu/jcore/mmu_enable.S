@@ -21,8 +21,10 @@
  * Scratch: r0, r1. All other registers preserved.
  *
  * Sequence (linux-spec.md §11, hardware-spec.md §2.6/§2.7/§2.3):
- *   1. Program TSBBR (TSB base [31:N+4] | TSB_SIZE_LOG [3:0]) to point
- *      at the boot TSB, whose PA is passed in r4.
+ *   1. Program TSBBR (TSB base [31:N+5] | TSB_SIZE_LOG [3:0]) to point
+ *      at the boot TSB, whose PA is passed in r4. TSB_SIZE_LOG counts
+ *      SETS of JCORE_TSB_SET_BYTES (32), not 16-byte entries -- see
+ *      JCORE_BOOT_TSB_BYTES in cpu/mmu_context.h.
  *   2. Program TSBCFG (HASH_MODE=1, HASH_SHIFT=TSB_SIZE_LOG) so
  *      hardware's XOR-fold hash is well spread from the very first
  *      TLB miss.
