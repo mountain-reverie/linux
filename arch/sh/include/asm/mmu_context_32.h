@@ -4,9 +4,12 @@
 
 #ifdef CONFIG_CPU_JCORE
 /*
- * J-Core J4: ASID lives in the dedicated ASIDR control register
- * (LDC/STC-only, no MMIO address — hardware-spec.md §2.1a), not in
- * PTEH like SH-3/SH-4. ASIDR holds a 16-bit ASID_TAG:
+ * J-Core J4: ASID lives in the dedicated ASIDR control register, not in
+ * PTEH like SH-3/SH-4. Writes use LDC; reads use the read-only MMIO alias
+ * at JCORE_ASIDR (0xFF000038) — `STC ASIDR,Rn` was retired with the other
+ * six MMU read encodings once the hardware TSB walker made the software
+ * fast path dead code (hardware-spec.md §2.1a, §3.1). ASIDR holds a 16-bit
+ * ASID_TAG:
  *   bits [11:0]  = 12-bit ASID
  *   bits [15:12] = low 4 bits of the TLB generation/rollover counter
  * (linux-spec.md §5.2-5.3). ASID 0 is reserved for the kernel/global
