@@ -67,7 +67,23 @@ static inline unsigned long get_asid(void)
 {
 	unsigned long tag;
 
-	__asm__ __volatile__ ("stc asidr, %0" : "=r" (tag));
+	/*
+	 * Read the P4 MMIO alias (0xFF000038) rather than STC ASIDR -- that
+	 * form is retiring (Phase 3, jcore-cpu task-1); the LDC write side
+	 * in set_asid() above is unaffected (D7).
+	 *
+	 * This must read HARDWARE, not asid_cache(cpu): asid_cache(cpu)
+	 * tracks the full context of the mm currently ACTIVE on this CPU,
+	 * but set_asid()'s own comment records that tlbflush_32.c's save/
+	 * restore dance calls set_asid(saved_asid) with a tag captured by an
+	 * *earlier* get_asid() from a *different* mm, recomposed with
+	 * whatever gen_low happens to be live now. That is exactly a case
+	 * where the value ASIDR holds is not the running mm's asid_cache
+	 * entry, so asid_cache(cpu) is not an equivalent, cheaper substitute
+	 * here -- only the hardware register reflects what the last
+	 * set_asid() actually programmed.
+	 */
+	tag = __raw_readl(JCORE_ASIDR);
 	/*
 	 * Return the full 16-bit ASID_TAG (asid | gen_low<<12), not just the
 	 * 12-bit ASID: tlbflush_32.c saves this and restores it verbatim via

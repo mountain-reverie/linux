@@ -35,10 +35,7 @@
  */
 static inline unsigned long jcore_read_tsbptr(void)
 {
-	unsigned long tsbptr;
-
-	__asm__ __volatile__("stc tsbptr, %0" : "=r" (tsbptr));
-	return tsbptr;
+	return __raw_readl(TSBPTR);
 }
 
 /*
@@ -310,7 +307,7 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 	 * is already present, so this cannot leave a stale duplicate of it
 	 * in the other way.
 	 */
-	__asm__ __volatile__("stc asidr, %0" : "=r" (asid_tag));
+	asid_tag = __raw_readl(JCORE_ASIDR);
 	tsb_set = jcore_tsb_slot_addr(address);
 	jcore_tsb_write_entry(tsb_set, jcore_tsb_pick_way(tsb_set, pteh),
 			      pteh, asid_tag, ptel);

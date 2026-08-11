@@ -2,13 +2,20 @@
 /*
  * J-Core J4 MMU MMIO register layout.
  *
- * PTEH/PTEL/PTEU and ASIDR are LDC/STC-only control registers with no
- * MMIO address (hardware-spec.md §2.1, §2.1a) — they are not defined
- * here; access them via ldc/stc in asm.
+ * PTEH/PTEL/PTEU and ASIDR remain LDC/STC-only control registers for
+ * WRITES (hardware-spec.md §2.1, §2.1a) -- the LDC forms are still how
+ * software installs a translation, and the design deliberately keeps them
+ * (D7: preserves the hypervisor's one-trap guest-refill path). TSB-walker
+ * Phase 3 (jcore-cpu task-1) added read-only P4 MMIO aliases for
+ * PTEH/PTEL/ASIDR alongside the pre-existing TSBPTR alias below, so kernel
+ * code that only needs to read back the current value no longer has to
+ * use STC.
  */
 #ifndef __ASM_CPU_JCORE_MMU_CONTEXT_H
 #define __ASM_CPU_JCORE_MMU_CONTEXT_H
 
+#define JCORE_PTEH	0xFF000000	/* PTEH (read-only P4 alias of STC PTEH) */
+#define JCORE_PTEL	0xFF000004	/* PTEL (read-only P4 alias of STC PTEL) */
 #define MMU_TTB		0xFF000008	/* Translation table base (SW scratch, HW ignores) */
 #define MMU_TEA		0xFF00000C	/* TLB Exception Address */
 #define MMU_FSR		0xFF00002C	/* TLB Fault Status (direction/cause; read-only) */
@@ -18,6 +25,7 @@
 #define TSBBR		0xFF000014	/* TSB Base Register (boot config, MMIO only) */
 #define TSBCFG		0xFF000018	/* TSB Config Register (boot config, MMIO only) */
 #define TSBPTR		0xFF00001C	/* TSB Pointer (read-only mirror of STC TSBPTR) */
+#define JCORE_ASIDR	0xFF000038	/* ASIDR (read-only P4 alias of STC ASIDR) */
 
 /*
  * TSB slot-address helper (docs/soc/p4-mmio-map.md §3.2, offset 0x048,
