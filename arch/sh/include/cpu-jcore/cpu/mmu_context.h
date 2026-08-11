@@ -19,6 +19,24 @@
 #define TSBCFG		0xFF000018	/* TSB Config Register (boot config, MMIO only) */
 #define TSBPTR		0xFF00001C	/* TSB Pointer (read-only mirror of STC TSBPTR) */
 
+/*
+ * TSB slot-address helper (docs/soc/p4-mmio-map.md §3.2, offset 0x048,
+ * "TSBSLOT"). Write a VA, then read the same address back to get the TSB
+ * slot address for that VA -- exactly what the hardware TSB walker
+ * (core/tlb_walk.vhd) and TSBPTR-on-fault both use, computed by the one
+ * RTL function that owns that computation (core/datapath_pkg.vhd
+ * tsb_ptr()). Replaces the C-side jcore_tsb_slot_offset() mirror that
+ * used to reimplement tsb_ptr()'s hash bit-for-bit in software (removed
+ * with this register; see arch/sh/mm/tlb-jcore.c __update_tlb()).
+ *
+ * NOT yet at its documented P4 offset (0xFF000048): SEG_P4 is fully
+ * absorbed inside datapath.vhm before it can reach cpu.vhd's return path,
+ * so -- like the walker debug counters at 0xABCD0F00 -- this register is
+ * decoded at a P2 address instead (core/cpu.vhd tsb_slot_sel). Update
+ * this define (and the map) once Phase 3 plumbs a real P4 return path.
+ */
+#define JCORE_TSB_SLOT	0xABCD0F10
+
 /* MMUCR bit layout (hardware-spec.md §2.3) */
 #define MMUCR_AT	(1 << 0)	/* Address Translation enable */
 #define MMUCR_TI	(1 << 2)	/* TLB flush strobe (write-1) */

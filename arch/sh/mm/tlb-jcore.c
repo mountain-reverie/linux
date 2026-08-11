@@ -38,6 +38,44 @@ static inline unsigned long jcore_read_tsbptr(void)
 }
 
 /*
+ * jcore_tsb_write_entry() - the ONLY place that stores the three words of
+ * a TSB slot.
+ *
+ * Commit order matters: the hardware TSB walker (core/tlb_walk.vhd)
+ * compares tag_hi FIRST, then tag_lo, and only then reads data and
+ * installs it -- so tag_hi is the commit point. Writing it before data/
+ * tag_lo lets a walker that lands between the stores observe tag_hi
+ * already matching the new VPN while tag_lo/data still belong to whatever
+ * this slot held before: a torn read that installs a wrong translation
+ * with no exception and no diagnostic (docs/mmu/hardware-spec.md §5;
+ * jcore-cpu sim/tests/mmuwalktorn.S). Write data and tag_lo first, tag_hi
+ * last, with a compiler barrier immediately before the tag_hi store so
+ * gcc cannot itself reorder the commit point out from under this comment.
+ *
+ * core/tlb_walk.vhd cannot distinguish a torn TSB entry from a legitimate
+ * one, so no bare-metal guard can catch a regression of this order --
+ * this helper is the only thing standing between "correct" and "silently
+ * wrong". A future writer must edit THIS function to get it wrong, with
+ * the reasoning right in front of them, instead of being able to
+ * open-code a fourth, unreviewed store site.
+ *
+ * @slot:     byte address of the 3-word (12-byte) TSB entry.
+ * @vpn:      tag_hi -- the faulting VPN (page-aligned address).
+ * @asid_tag: tag_lo -- the ASID_TAG this entry is valid for.
+ * @ptel:     data -- the hardware PTEL image.
+ */
+static inline void jcore_tsb_write_entry(unsigned long slot,
+					  unsigned long vpn,
+					  unsigned long asid_tag,
+					  unsigned long ptel)
+{
+	*(unsigned long *)(slot + 8) = ptel;		/* data   (PTEL)      */
+	*(unsigned long *)(slot + 4) = asid_tag;	/* tag_lo (ASID_TAG)  */
+	barrier();
+	*(unsigned long *)(slot + 0) = vpn;		/* tag_hi -- commit point */
+}
+
+/*
  * jcore_tlb_walk_mark_accessed() - the *only* piece of __jcore_tlb_walk()
  * that isn't a pure function of its arguments: it writes the software
  * _PAGE_ACCESSED bit back into the live page table. Split out as its own
@@ -120,56 +158,31 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 
 	vpn = addr & PAGE_MASK;
 	tsb_slot = jcore_read_tsbptr();
-	/*
-	 * Commit order matters: the hardware TSB walker (core/tlb_walk.vhd)
-	 * compares tag_hi FIRST, then tag_lo, and only then reads data and
-	 * installs it -- so tag_hi is the commit point. Writing it before
-	 * data/tag_lo (as this used to) lets a walker that lands between the
-	 * stores observe tag_hi already matching the new VPN while tag_lo/
-	 * data still belong to whatever this slot held before: a torn read
-	 * that installs a wrong translation with no exception and no
-	 * diagnostic (docs/mmu/hardware-spec.md §5; jcore-cpu
-	 * sim/tests/mmuwalktorn.S). Write data and tag_lo first, tag_hi last,
-	 * with a compiler barrier immediately before the tag_hi store so gcc
-	 * cannot itself reorder the commit point out from under this comment.
-	 */
-	*(unsigned long *)(tsb_slot + 8) = ptel;		/* data   (PTEL)      */
-	*(unsigned long *)(tsb_slot + 4) = pteh_tag;		/* tag_lo (ASID_TAG) */
-	barrier();
-	*(unsigned long *)(tsb_slot + 0) = vpn;		/* tag_hi -- commit point */
+	jcore_tsb_write_entry(tsb_slot, vpn, pteh_tag, ptel);
 
 	return 0;
 }
 
 /*
- * jcore_tsb_slot_offset() - byte offset, within the boot TSB, of the slot
- * hardware would compute in TSBPTR for a fault at @addr.
+ * jcore_tsb_slot_addr() - the TSB slot address hardware would compute for
+ * a fault at @addr, via the JCORE_TSB_SLOT MMIO helper (write VA, read
+ * slot address; see its definition in cpu/mmu_context.h). This used to be
+ * jcore_tsb_slot_offset(), a from-scratch C reimplementation of the RTL's
+ * tsb_ptr() hash that had to be kept bit-for-bit in sync by hand; that
+ * requirement is gone now that the kernel asks the hardware function
+ * directly instead of mirroring it.
  *
- * Must mirror the RTL bit-for-bit (jcore-cpu core/datapath.vhm, the "TSB
- * pointer assist" block; hardware-spec.md §2.8):
- *
- *	vpn  = VA[31:12]			-- a *fixed* 12-bit shift in
- *						   hardware, NOT PAGE_SHIFT
- *	hash = vpn ^ (vpn >> HASH_SHIFT)	-- HASH_MODE=1
- *	slot = (hash & ((1 << TSB_SIZE_LOG) - 1)) << 4
- *
- * with HASH_SHIFT == TSB_SIZE_LOG == JCORE_BOOT_TSB_SIZE_LOG, as
- * programmed once by jcore_mmu_enable (arch/sh/kernel/cpu/jcore/
- * mmu_enable.S) and never rewritten.
- *
- * Note the 12 is deliberate and is not a PAGE_SHIFT bug: hardware hashes
- * 4 KB-granular page numbers regardless of the kernel's 16 KB base page
- * size, so the four 4 KB-granular VAs inside one 16 KB page can hash to
- * four different slots. That only ever costs a fast-path miss (the slot
- * tags are still compared), never a wrong translation -- the TSB is a
- * hint cache, not an authority.
+ * Note VA[31:12] is a *fixed* 12-bit shift in hardware, NOT PAGE_SHIFT:
+ * hardware hashes 4 KB-granular page numbers regardless of the kernel's
+ * 16 KB base page size, so the four 4 KB-granular VAs inside one 16 KB
+ * page can land in four different slots. That only ever costs a
+ * fast-path miss (the slot tags are still compared), never a wrong
+ * translation -- the TSB is a hint cache, not an authority.
  */
-static inline unsigned long jcore_tsb_slot_offset(unsigned long addr)
+static inline unsigned long jcore_tsb_slot_addr(unsigned long addr)
 {
-	unsigned long vpn = addr >> 12;
-	unsigned long hash = vpn ^ (vpn >> JCORE_BOOT_TSB_SIZE_LOG);
-
-	return (hash & ((1UL << JCORE_BOOT_TSB_SIZE_LOG) - 1)) << 4;
+	__raw_writel(addr, JCORE_TSB_SLOT);
+	return __raw_readl(JCORE_TSB_SLOT);
 }
 
 /*
@@ -211,14 +224,8 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 	 * writes (tag_hi = VPN, tag_lo = ASID_TAG, data = PTEL).
 	 */
 	__asm__ __volatile__("stc asidr, %0" : "=r" (asid_tag));
-	tsb_slot = (unsigned long)jcore_boot_tsb +
-		   jcore_tsb_slot_offset(address);
-	/* Commit order: data, tag_lo, tag_hi -- see the comment in
-	 * __jcore_tlb_walk() above; tag_hi is the walker's commit point. */
-	*(unsigned long *)(tsb_slot + 8) = ptel;	/* data   */
-	*(unsigned long *)(tsb_slot + 4) = asid_tag;	/* tag_lo */
-	barrier();
-	*(unsigned long *)(tsb_slot + 0) = pteh;	/* tag_hi -- commit point */
+	tsb_slot = jcore_tsb_slot_addr(address);
+	jcore_tsb_write_entry(tsb_slot, pteh, asid_tag, ptel);
 
 	local_irq_restore(flags);
 }
