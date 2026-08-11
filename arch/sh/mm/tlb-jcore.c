@@ -120,9 +120,23 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 
 	vpn = addr & PAGE_MASK;
 	tsb_slot = jcore_read_tsbptr();
-	*(unsigned long *)(tsb_slot + 0) = vpn;		/* tag_hi */
-	*(unsigned long *)(tsb_slot + 4) = pteh_tag;		/* tag_lo (ASID_TAG) */
+	/*
+	 * Commit order matters: the hardware TSB walker (core/tlb_walk.vhd)
+	 * compares tag_hi FIRST, then tag_lo, and only then reads data and
+	 * installs it -- so tag_hi is the commit point. Writing it before
+	 * data/tag_lo (as this used to) lets a walker that lands between the
+	 * stores observe tag_hi already matching the new VPN while tag_lo/
+	 * data still belong to whatever this slot held before: a torn read
+	 * that installs a wrong translation with no exception and no
+	 * diagnostic (docs/mmu/hardware-spec.md §5; jcore-cpu
+	 * sim/tests/mmuwalktorn.S). Write data and tag_lo first, tag_hi last,
+	 * with a compiler barrier immediately before the tag_hi store so gcc
+	 * cannot itself reorder the commit point out from under this comment.
+	 */
 	*(unsigned long *)(tsb_slot + 8) = ptel;		/* data   (PTEL)      */
+	*(unsigned long *)(tsb_slot + 4) = pteh_tag;		/* tag_lo (ASID_TAG) */
+	barrier();
+	*(unsigned long *)(tsb_slot + 0) = vpn;		/* tag_hi -- commit point */
 
 	return 0;
 }
@@ -199,9 +213,12 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 	__asm__ __volatile__("stc asidr, %0" : "=r" (asid_tag));
 	tsb_slot = (unsigned long)jcore_boot_tsb +
 		   jcore_tsb_slot_offset(address);
-	*(unsigned long *)(tsb_slot + 0) = pteh;	/* tag_hi */
-	*(unsigned long *)(tsb_slot + 4) = asid_tag;	/* tag_lo */
+	/* Commit order: data, tag_lo, tag_hi -- see the comment in
+	 * __jcore_tlb_walk() above; tag_hi is the walker's commit point. */
 	*(unsigned long *)(tsb_slot + 8) = ptel;	/* data   */
+	*(unsigned long *)(tsb_slot + 4) = asid_tag;	/* tag_lo */
+	barrier();
+	*(unsigned long *)(tsb_slot + 0) = pteh;	/* tag_hi -- commit point */
 
 	local_irq_restore(flags);
 }
