@@ -20,7 +20,8 @@
  * @addr:      faulting address
  * @pteh_tag:  expected ASID_TAG (TSB tag_lo)
  *
- * Returns 0 on success (TLB populated, execute LDTLB.RN);
+ * Returns 0 on success (TSB row written; the caller just returns and the
+ * hardware walker installs from that row on the re-executed access);
  * returns nonzero on failure (not present or protected).
  */
 int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag);

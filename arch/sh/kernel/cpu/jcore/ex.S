@@ -126,8 +126,8 @@ ENTRY(jcore_tlb_miss)			/* alias: SP2 bare-metal harness entry */
 	jsr	@r0			! __jcore_tlb_walk(pgd, addr, asid_tag)
 	 nop
 
-	! r0 = 0 on success (PTEL already loaded by the walker); nonzero
-	! means no valid mapping was found -- a real fault.
+	! r0 = 0 on success (the walker has written the TSB row for this
+	! VPN/ASID); nonzero means no valid mapping was found -- a real fault.
 	tst	r0, r0
 	bf	jcore_tlb_real_fault
 
@@ -136,7 +136,23 @@ ENTRY(jcore_tlb_miss)			/* alias: SP2 bare-metal harness entry */
 	mov.l	@r15+, r6
 	mov.l	@r15+, r5
 	mov.l	@r15+, r4
-	ldtlb.rn			! install TLB entry + return (no delay slot)
+	! Software no longer installs into the TLB: it only makes the
+	! mapping *available* in the TSB and returns. The faulting access
+	! re-executes, misses again, and the hardware TSB walker installs
+	! from the row we just wrote.
+	!
+	! LIVELOCK WARNING: because we no longer install, a row the walker
+	! refuses (wrong set, V clear, _PAGE_STALE) makes this fault repeat
+	! forever instead of oopsing. jcore_tsb_write_entry() writing the
+	! set the hardware itself computes (JCORE_TSB_SLOT), and the walk
+	! returning -EFAULT for _PAGE_STALE, are what keep that from
+	! happening; there is deliberately no retry counter here (the
+	! handler is stateless and re-entered from scratch each fault).
+	!
+	! r15 is not banked and r4-r7 are, so the final pop must complete
+	! before rte flips SR.RB -- do not fold it into the delay slot.
+	rte
+	 nop
 
 jcore_tlb_real_fault:
 	! Restore PR (the interrupted context's real return-context state;
