@@ -10,8 +10,10 @@
  * six causes, see arch/sh/kernel/cpu/jcore/ex.S). The hot path there probes
  * the two-word TSB tag directly; __jcore_tlb_walk() below is the slow
  * path it falls back to on a TSB miss, walking the real Linux page
- * table and re-populating both PTEL and the TSB slot for next time
- * (docs/mmu/linux-spec.md §4.2).
+ * table and re-populating the TSB slot for next time
+ * (docs/mmu/linux-spec.md §4.2). Software never installs a TLB entry
+ * itself: it writes the TSB row and returns, and the hardware TSB
+ * walker installs from that row when the access re-executes.
  */
 #include <linux/mm.h>
 #include <linux/sched.h>
@@ -143,11 +145,11 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  * CONFIG_64BIT/PAE arm here, those are a separate, later port.
  *
  * On success: sets the software _PAGE_ACCESSED bit if unset, builds the
- * hardware PTEL image via jcore_pte_to_ptel(), loads it into PTEL, and
- * rewrites one way of the 32-byte TSB set (tag_hi = VPN,
- * tag_lo = ASID_TAG, data = PTEL) so the next miss to this VPN/ASID hits
- * the fast path.
- * Returns 0 and expects the caller (tlbmiss.S) to execute LDTLB.RN.
+ * hardware PTEL image via jcore_pte_to_ptel(), and rewrites one way of
+ * the 32-byte TSB set (tag_hi = VPN, tag_lo = ASID_TAG, data = PTEL).
+ * Returns 0. The caller does NOT install anything: it simply returns,
+ * the access re-executes and misses again, and the hardware TSB walker
+ * installs from the row written here.
  *
  * On failure (not present, or software PROTNONE/STALE marker set):
  * returns nonzero; the caller falls through to the generic fault path.
@@ -194,8 +196,6 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 	}
 
 	ptel = jcore_pte_to_ptel(pte_val(entry));
-
-	__asm__ __volatile__("ldc %0, ptel" : : "r" (ptel));
 
 	vpn = addr & PAGE_MASK;
 	tsb_set = jcore_read_tsbptr();
@@ -267,18 +267,17 @@ static inline unsigned long jcore_tsb_slot_addr(unsigned long addr)
 }
 
 /*
- * __update_tlb() - proactively prime the TLB/TSB for a freshly-faulted-in
+ * __update_tlb() - proactively prime the TSB for a freshly-faulted-in
  * pte (called from update_mmu_cache() right after the generic fault
  * handler installs the pte). Not strictly required for correctness (the
  * next access would just retake a TLB miss and __jcore_tlb_walk() would
- * populate it lazily), but avoids that guaranteed extra trap.
+ * populate the row lazily), but avoids that guaranteed extra trap into
+ * software.
  *
- * The TSB slot is rewritten here as well as the hardware TLB entry. If
- * only the TLB were primed, the (single, global, flush-surviving) TSB
- * would keep whatever stale PTEL a previous walk left for this VPN, and
- * the very next hardware-TLB flush would resurrect it -- the exact
- * divergence local_flush_tlb_all() below now also guards against. Prime
- * both or neither; never one.
+ * Only the TSB is written: software no longer installs TLB entries at
+ * all, the hardware walker is the sole installer and it installs from
+ * this row. That also removes the old TLB-vs-TSB divergence hazard -- a
+ * stale row cannot be masked by a fresher hardware-TLB entry any more.
  */
 void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 {
@@ -293,14 +292,8 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 	pteh = address & PAGE_MASK;
 	ptel = jcore_pte_to_ptel(pte_val(pte));
 
-	__asm__ __volatile__(
-		"ldc	%0, pteh\n\t"
-		"ldc	%1, ptel\n\t"
-		"ldtlb.rn"
-		: : "r" (pteh), "r" (ptel) : "memory");
-
 	/*
-	 * Mirror the TLB entry into the TSB set the walker would probe for
+	 * Prime the TSB set the walker would probe for
 	 * this VPN, with the same three-word layout __jcore_tlb_walk()
 	 * writes (tag_hi = VPN, tag_lo = ASID_TAG, data = PTEL), into the
 	 * way jcore_tsb_pick_way() selects -- the MATCHING way if this VPN
@@ -321,8 +314,8 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
  *
  * MMUCR.TI reaches the *hardware* TLB only. The software TSB
  * (jcore_boot_tsb) is a second, independent translation cache that the
- * fast path in arch/sh/kernel/cpu/jcore/ex.S trusts on a miss and
- * reinstalls with LDTLB.RN without re-consulting the page table. A TSB
+ * hardware walker installs from on a miss without consulting the page
+ * table. A TSB
  * slot that survived a flush is therefore not a stale hint but a stale
  * *translation*: write-protecting a pte and flushing (fork()/COW,
  * mprotect(), dirty tracking) would leave the pre-flush W=1 slot live and
