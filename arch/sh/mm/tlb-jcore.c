@@ -25,16 +25,94 @@
 #include <cpu/mmu_context.h>
 
 /*
- * jcore_read_tsbptr() - read back the (unchanged) TSB slot address the
+ * jcore_read_tsbptr() - read back the (unchanged) TSB set address the
  * hot path already computed. Kept as a one-line helper so
  * __jcore_tlb_walk() has no dependency beyond it and jcore_pte_to_ptel().
+ *
+ * The value is a kernel virtual (P1) address and may be dereferenced as
+ * one -- see the address-space note on jcore_tsb_slot_addr() below for
+ * why that is true and what keeps it true.
  */
 static inline unsigned long jcore_read_tsbptr(void)
 {
-	unsigned long tsbptr;
+	return __raw_readl(TSBPTR);
+}
 
-	__asm__ __volatile__("stc tsbptr, %0" : "=r" (tsbptr));
-	return tsbptr;
+/*
+ * jcore_tsb_write_entry() - the ONLY place that stores the three words of
+ * a TSB entry.
+ *
+ * Commit order matters: the hardware TSB walker (core/tlb_walk.vhd)
+ * compares tag_hi FIRST, then tag_lo, and only then reads data and
+ * installs it -- so tag_hi is the commit point. Writing it before data/
+ * tag_lo lets a walker that lands between the stores observe tag_hi
+ * already matching the new VPN while tag_lo/data still belong to whatever
+ * this slot held before: a torn read that installs a wrong translation
+ * with no exception and no diagnostic (docs/mmu/hardware-spec.md §5;
+ * jcore-cpu sim/tests/mmuwalktorn.S). Write data and tag_lo first, tag_hi
+ * last, with a compiler barrier immediately before the tag_hi store so
+ * gcc cannot itself reorder the commit point out from under this comment.
+ *
+ * core/tlb_walk.vhd cannot distinguish a torn TSB entry from a legitimate
+ * one, so no bare-metal guard can catch a regression of this order --
+ * this helper is the only thing standing between "correct" and "silently
+ * wrong". A future writer must edit THIS function to get it wrong, with
+ * the reasoning right in front of them, instead of being able to
+ * open-code a fourth, unreviewed store site.
+ *
+ * @set:      byte address of the 32-byte, 2-way TSB SET (from TSBPTR or
+ *            JCORE_TSB_SLOT -- hardware now returns a set, not an entry).
+ * @way:      which way of the set to write; see jcore_tsb_pick_way().
+ * @vpn:      tag_hi -- the faulting VPN (page-aligned address).
+ * @asid_tag: tag_lo -- the ASID_TAG this entry is valid for.
+ * @ptel:     data -- the hardware PTEL image.
+ */
+static inline void jcore_tsb_write_entry(unsigned long set,
+					  unsigned int way,
+					  unsigned long vpn,
+					  unsigned long asid_tag,
+					  unsigned long ptel)
+{
+	unsigned long slot = set + way * JCORE_TSB_ENTRY_BYTES;
+
+	*(unsigned long *)(slot + 8) = ptel;		/* data   (PTEL)      */
+	*(unsigned long *)(slot + 4) = asid_tag;	/* tag_lo (ASID_TAG)  */
+	barrier();
+	*(unsigned long *)(slot + 0) = vpn;		/* tag_hi -- commit point */
+}
+
+/*
+ * jcore_tsb_pick_way() - choose which way of @set to write for @vpn.
+ *
+ * The rule is: if either way already holds this VPN, OVERWRITE THAT WAY.
+ * Only when neither matches do we take the hardware's victim nomination.
+ *
+ * This is not an optimisation and must not be "optimised" into always
+ * taking the victim. Overwriting the matching way is what makes a stale
+ * duplicate of a VPN unconstructable. Suppose a fresh entry for VPN X went
+ * to way 1 while a stale entry for the same X still sat in way 0: the next
+ * walk probes way 0 first, matches its tag, and installs the STALE PTEL --
+ * wrong permissions, no exception, no diagnostic. Hardware cannot detect
+ * that; the tags are both legitimate. One index function plus both ways in
+ * a single 32-byte line is precisely what lets software rule it out here,
+ * for the cost of one extra load it has already paid for (the set is one
+ * cache line).
+ *
+ * The victim nomination comes from a hardware LFSR seeded by the OS at
+ * init (jcore_tsb_victim_seed_init(), arch/sh/kernel/cpu/jcore/probe.c);
+ * see JCORE_TSB_VICTIM.
+ */
+static inline unsigned int jcore_tsb_pick_way(unsigned long set,
+					      unsigned long vpn)
+{
+	const unsigned long *tags = (const unsigned long *)set;
+	unsigned int way;
+
+	for (way = 0; way < JCORE_TSB_WAYS; way++)
+		if (tags[way * (JCORE_TSB_ENTRY_BYTES / sizeof(long))] == vpn)
+			return way;
+
+	return __raw_readl(JCORE_TSB_VICTIM) & (JCORE_TSB_WAYS - 1);
 }
 
 /*
@@ -66,8 +144,9 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  *
  * On success: sets the software _PAGE_ACCESSED bit if unset, builds the
  * hardware PTEL image via jcore_pte_to_ptel(), loads it into PTEL, and
- * rewrites the 3-word TSB slot (tag_hi = VPN, tag_lo = ASID_TAG,
- * data = PTEL) so the next miss to this VPN/ASID hits the fast path.
+ * rewrites one way of the 32-byte TSB set (tag_hi = VPN,
+ * tag_lo = ASID_TAG, data = PTEL) so the next miss to this VPN/ASID hits
+ * the fast path.
  * Returns 0 and expects the caller (tlbmiss.S) to execute LDTLB.RN.
  *
  * On failure (not present, or software PROTNONE/STALE marker set):
@@ -81,7 +160,7 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 	pte_t *ptep;
 	pte_t entry;
 	unsigned long ptel;
-	unsigned long tsb_slot;
+	unsigned long tsb_set;
 	unsigned long vpn;
 
 	pgd += pgd_index(addr);
@@ -119,43 +198,72 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 	__asm__ __volatile__("ldc %0, ptel" : : "r" (ptel));
 
 	vpn = addr & PAGE_MASK;
-	tsb_slot = jcore_read_tsbptr();
-	*(unsigned long *)(tsb_slot + 0) = vpn;		/* tag_hi */
-	*(unsigned long *)(tsb_slot + 4) = pteh_tag;		/* tag_lo (ASID_TAG) */
-	*(unsigned long *)(tsb_slot + 8) = ptel;		/* data   (PTEL)      */
+	tsb_set = jcore_read_tsbptr();
+	jcore_tsb_write_entry(tsb_set, jcore_tsb_pick_way(tsb_set, vpn),
+			      vpn, pteh_tag, ptel);
 
 	return 0;
 }
 
 /*
- * jcore_tsb_slot_offset() - byte offset, within the boot TSB, of the slot
- * hardware would compute in TSBPTR for a fault at @addr.
+ * jcore_tsb_slot_addr() - the TSB SET address hardware would compute for
+ * a fault at @addr, via the JCORE_TSB_SLOT MMIO helper (write VA, read
+ * slot address; see its definition in cpu/mmu_context.h). This used to be
+ * jcore_tsb_slot_offset(), a from-scratch C reimplementation of the RTL's
+ * tsb_ptr() hash that had to be kept bit-for-bit in sync by hand; that
+ * requirement is gone now that the kernel asks the hardware function
+ * directly instead of mirroring it.
  *
- * Must mirror the RTL bit-for-bit (jcore-cpu core/datapath.vhm, the "TSB
- * pointer assist" block; hardware-spec.md §2.8):
+ * Note VA[31:12] is a *fixed* 12-bit shift in hardware, NOT PAGE_SHIFT:
+ * hardware hashes 4 KB-granular page numbers regardless of the kernel's
+ * 16 KB base page size, so the four 4 KB-granular VAs inside one 16 KB
+ * page can land in four different slots. That only ever costs a
+ * fast-path miss (the slot tags are still compared), never a wrong
+ * translation -- the TSB is a hint cache, not an authority.
  *
- *	vpn  = VA[31:12]			-- a *fixed* 12-bit shift in
- *						   hardware, NOT PAGE_SHIFT
- *	hash = vpn ^ (vpn >> HASH_SHIFT)	-- HASH_MODE=1
- *	slot = (hash & ((1 << TSB_SIZE_LOG) - 1)) << 4
+ * ADDRESS SPACE -- why dereferencing this return value is correct.
  *
- * with HASH_SHIFT == TSB_SIZE_LOG == JCORE_BOOT_TSB_SIZE_LOG, as
- * programmed once by jcore_mmu_enable (arch/sh/kernel/cpu/jcore/
- * mmu_enable.S) and never rewritten.
+ * Both this helper and jcore_read_tsbptr() return
+ * `(TSBBR & ~0x1F) | (hash << 5)`: TSBBR's own bits [31:5] verbatim, with
+ * only the low index bits substituted. So whichever address space TSBBR
+ * is programmed in, that is the space the answer comes back in --
+ * hardware never converts.
  *
- * Note the 12 is deliberate and is not a PAGE_SHIFT bug: hardware hashes
- * 4 KB-granular page numbers regardless of the kernel's 16 KB base page
- * size, so the four 4 KB-granular VAs inside one 16 KB page can hash to
- * four different slots. That only ever costs a fast-path miss (the slot
- * tags are still compared), never a wrong translation -- the TSB is a
- * hint cache, not an authority.
+ * TSBBR is therefore programmed with the boot TSB's P1 KERNEL VIRTUAL
+ * address (arch/sh/kernel/head_32.S, .LJCORE_TSB_PHYS -> r4 ->
+ * jcore_mmu_enable()), NOT its physical address, and that is a deliberate
+ * contract with the RTL, not an accident:
+ *
+ *   - The hardware TSB walker fetches entries with its own bus master and
+ *     applies the SH P1 fold (PA = VA & 0x1FFFFFFF) to its own address
+ *     before driving it -- jcore-cpu core/cpu.vhd, g_dstore_squash, the
+ *     `walk_own` takeover arm, whose comment states outright that "every
+ *     TSBBR the guards and linux@jcore program is a P1 kernel address ...
+ *     which the software miss handler reads through the fold". Feed the
+ *     walker a bare PA instead and it is left unfolded and the entry is
+ *     fetched from the wrong place.
+ *   - Software gets a P1 address back, which is untranslated and cached
+ *     and so may be dereferenced directly -- here, in
+ *     jcore_tsb_pick_way(), in jcore_tsb_write_entry(), and in the
+ *     assembly fast path (arch/sh/kernel/cpu/jcore/ex.S), which loads
+ *     straight from STC TSBPTR with no conversion.
+ *
+ * A physical TSBBR would break BOTH ends. Software would be dereferencing
+ * e.g. 0x10001000, which is P0 and therefore TRANSLATED once MMUCR.AT is
+ * set: a translated access to an unrelated user VA, and inside the TLB
+ * vector (SR.BL=1) a miss on it is a double fault rather than a
+ * diagnostic. Nothing in the guard suite can catch that -- the SP2 cosim
+ * harness maps VA==PA -- which is exactly why the invariant is written
+ * down here instead of being left to a test.
+ *
+ * So: do NOT "fix" this by adding __va()/__pa() at this boundary. The
+ * conversion belongs at the single point where TSBBR is programmed, and
+ * it is already there.
  */
-static inline unsigned long jcore_tsb_slot_offset(unsigned long addr)
+static inline unsigned long jcore_tsb_slot_addr(unsigned long addr)
 {
-	unsigned long vpn = addr >> 12;
-	unsigned long hash = vpn ^ (vpn >> JCORE_BOOT_TSB_SIZE_LOG);
-
-	return (hash & ((1UL << JCORE_BOOT_TSB_SIZE_LOG) - 1)) << 4;
+	__raw_writel(addr, JCORE_TSB_SLOT);
+	return __raw_readl(JCORE_TSB_SLOT);
 }
 
 /*
@@ -174,7 +282,7 @@ static inline unsigned long jcore_tsb_slot_offset(unsigned long addr)
  */
 void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 {
-	unsigned long flags, pteh, ptel, asid_tag, tsb_slot;
+	unsigned long flags, pteh, ptel, asid_tag, tsb_set;
 
 	/* Handle debugger faulting in the debuggee. */
 	if (vma && current->active_mm != vma->vm_mm)
@@ -192,16 +300,17 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 		: : "r" (pteh), "r" (ptel) : "memory");
 
 	/*
-	 * Mirror the TLB entry into the TSB slot the fast path would probe
-	 * for this VPN, with the same three-word layout __jcore_tlb_walk()
-	 * writes (tag_hi = VPN, tag_lo = ASID_TAG, data = PTEL).
+	 * Mirror the TLB entry into the TSB set the walker would probe for
+	 * this VPN, with the same three-word layout __jcore_tlb_walk()
+	 * writes (tag_hi = VPN, tag_lo = ASID_TAG, data = PTEL), into the
+	 * way jcore_tsb_pick_way() selects -- the MATCHING way if this VPN
+	 * is already present, so this cannot leave a stale duplicate of it
+	 * in the other way.
 	 */
-	__asm__ __volatile__("stc asidr, %0" : "=r" (asid_tag));
-	tsb_slot = (unsigned long)jcore_boot_tsb +
-		   jcore_tsb_slot_offset(address);
-	*(unsigned long *)(tsb_slot + 0) = pteh;	/* tag_hi */
-	*(unsigned long *)(tsb_slot + 4) = asid_tag;	/* tag_lo */
-	*(unsigned long *)(tsb_slot + 8) = ptel;	/* data   */
+	asid_tag = __raw_readl(JCORE_ASIDR);
+	tsb_set = jcore_tsb_slot_addr(address);
+	jcore_tsb_write_entry(tsb_set, jcore_tsb_pick_way(tsb_set, pteh),
+			      pteh, asid_tag, ptel);
 
 	local_irq_restore(flags);
 }
@@ -223,7 +332,8 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
  * caches here, together, always.
  *
  * A full memset() rather than a targeted slot invalidate: the boot TSB is
- * 4 KB (JCORE_BOOT_TSB_BYTES), local_flush_tlb_one() has no single-entry
+ * 8 KB (JCORE_BOOT_TSB_BYTES: 256 sets x 32 bytes), local_flush_tlb_one()
+ * has no single-entry
  * hardware primitive to pair with anyway and funnels straight here, and a
  * flush must never be cheaper than correct.
  *

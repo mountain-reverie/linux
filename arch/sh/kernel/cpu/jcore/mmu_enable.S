@@ -9,20 +9,26 @@
  * exercises.
  *
  * INPUT CONTRACT:
- *   r4 = boot-TSB PHYSICAL base address (jcore_boot_tsb - PAGE_OFFSET +
- *        __MEMORY_START in the real kernel). The physical address MUST
- *        already be aligned to its own size so that the low
- *        JCORE_BOOT_TSB_SIZE_LOG bits are zero (TSB_SIZE_LOG is OR'd
- *        into those bits below). This routine does NOT reference
- *        jcore_boot_tsb/PAGE_OFFSET/__MEMORY_START itself -- the caller
- *        computes the PA and relocation, so a cosim harness can pass in
- *        its own TSB PA without linking any kernel VA/PA symbols.
+ *   r4 = boot-TSB base address, as a P1 KERNEL VIRTUAL address (plain
+ *        `jcore_boot_tsb` in the real kernel, whose link address is
+ *        already in P1). NOT a physical address: the hardware walker
+ *        applies the P1 fold to whatever it derives from TSBBR, and
+ *        TSBPTR/JCORE_TSB_SLOT hand TSBBR's own high bits back to
+ *        software to dereference. See the long note at the call site in
+ *        arch/sh/kernel/head_32.S. The address MUST already be aligned to
+ *        its own size so that the low JCORE_BOOT_TSB_SIZE_LOG bits are
+ *        zero (TSB_SIZE_LOG is OR'd into those bits below). This routine
+ *        does NOT reference jcore_boot_tsb itself -- the caller supplies
+ *        the base, so a cosim harness can pass in its own TSB base
+ *        without linking any kernel symbols.
  *
  * Scratch: r0, r1. All other registers preserved.
  *
  * Sequence (linux-spec.md §11, hardware-spec.md §2.6/§2.7/§2.3):
- *   1. Program TSBBR (TSB base [31:N+4] | TSB_SIZE_LOG [3:0]) to point
- *      at the boot TSB, whose PA is passed in r4.
+ *   1. Program TSBBR (TSB base [31:N+5] | TSB_SIZE_LOG [3:0]) to point
+ *      at the boot TSB, whose PA is passed in r4. TSB_SIZE_LOG counts
+ *      SETS of JCORE_TSB_SET_BYTES (32), not 16-byte entries -- see
+ *      JCORE_BOOT_TSB_BYTES in cpu/mmu_context.h.
  *   2. Program TSBCFG (HASH_MODE=1, HASH_SHIFT=TSB_SIZE_LOG) so
  *      hardware's XOR-fold hash is well spread from the very first
  *      TLB miss.
