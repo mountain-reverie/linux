@@ -205,6 +205,15 @@ static inline void enable_mmu(void)
 	 * every secondary with an unseeded selector. Write-only in hardware;
 	 * the seed is never read back, which is the point (an open-source core
 	 * publishes the polynomial, so a recoverable seed is no seed at all).
+	 *
+	 * This is only a BEST-EFFORT boot seed: enable_mmu() for CPU0 runs from
+	 * setup_arch(), which init/main.c calls BEFORE random_init_early() and
+	 * random_init(), so get_random_u32() here draws on essentially no mixed-in
+	 * entropy yet. Every CPU still gets *some* seed the instant its MMU comes
+	 * up -- no CPU is ever left unseeded -- but the real, well-mixed seed
+	 * lands later via jcore_reseed_tsb_vseed(), a late_initcall in
+	 * arch/sh/kernel/cpu/jcore/probe.c that re-seeds every online CPU once
+	 * random_init() has actually run.
 	 */
 	__raw_writel(get_random_u32(), (void __iomem *)JCORE_TSB_VSEED);
 

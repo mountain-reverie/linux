@@ -300,6 +300,13 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 	 * is already present, so this cannot leave a stale duplicate of it
 	 * in the other way.
 	 */
+	/*
+	 * Deliberately a raw 32-bit read, not get_asid() (which returns only
+	 * the 12-bit ASID). tag_lo is compared full-width by the RTL, and
+	 * bits[15:12] are zero by construction here now that the generation
+	 * nibble set_asid() used to pack into them has been retired -- so the
+	 * two disagreeing about ASID_TAG's width is safe, not a live bug.
+	 */
 	asid_tag = __raw_readl(JCORE_ASIDR);
 	tsb_set = jcore_tsb_slot_addr(address);
 	jcore_tsb_write_entry(tsb_set, jcore_tsb_pick_way(tsb_set, pteh),

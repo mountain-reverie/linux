@@ -11,8 +11,11 @@
  * here to populate boot_cpu_data for /proc/cpuinfo and family dispatch
  * -- full capability-flag decoding is deferred to SP2/SP3 SMP bring-up.
  */
+#include <linux/build_bug.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/random.h>
+#include <linux/smp.h>
 #include <linux/threads.h>
 #include <asm/processor.h>
 #include <asm/cache.h>
@@ -47,6 +50,48 @@
  */
 char jcore_boot_tsb[NR_CPUS][JCORE_BOOT_TSB_BYTES]
 	__aligned(JCORE_BOOT_TSB_BYTES);
+
+/*
+ * Machine-check the geometry invariant the comment above documents: element
+ * size must equal JCORE_BOOT_TSB_BYTES for every row to land naturally
+ * aligned, and JCORE_BOOT_TSB_BYTES itself must be a power of two for
+ * jcore_mmu_enable() to OR TSB_SIZE_LOG straight into the low bits. A silent
+ * failure here leaves TSBBR pointing into garbage with no diagnostic.
+ */
+static_assert(sizeof(jcore_boot_tsb[0]) == JCORE_BOOT_TSB_BYTES);
+static_assert((JCORE_BOOT_TSB_BYTES & (JCORE_BOOT_TSB_BYTES - 1)) == 0);
+
+/*
+ * Re-seed every online CPU's TSB victim LFSR once the kernel RNG has
+ * actually been initialised. enable_mmu() (asm/mmu_context.h) already seeds
+ * JCORE_TSB_VSEED for every CPU the moment its MMU comes up, so no CPU is
+ * ever left unseeded -- but CPU0's call happens from setup_arch(), before
+ * random_init_early()/random_init() have mixed in any entropy, and on a
+ * J-core FPGA target there is no RDSEED and no bootloader entropy to fall
+ * back on. This late_initcall re-draws a real seed for every online CPU
+ * (secondaries get a second, better draw too; that's harmless -- the
+ * register is write-only and re-seeding never weakens it).
+ *
+ * The bare-metal cosim harnesses link tlb-jcore.o and define their own
+ * jcore_boot_tsb stub directly (sim/tests/mmulinux.S etc.) -- they do not
+ * link this file, so nothing added here needs a harness-side stub.
+ */
+static void jcore_reseed_tsb_vseed(void *unused)
+{
+	__raw_writel(get_random_u32(), (void __iomem *)JCORE_TSB_VSEED);
+}
+
+static int __init jcore_reseed_tsb_vseed_init(void)
+{
+	/*
+	 * on_each_cpu() runs the callback on every online CPU, including the
+	 * caller, and works correctly under !CONFIG_SMP (it just calls the
+	 * function locally with interrupts disabled) -- no #ifdef needed.
+	 */
+	on_each_cpu(jcore_reseed_tsb_vseed, NULL, 1);
+	return 0;
+}
+late_initcall(jcore_reseed_tsb_vseed_init);
 
 void __ref cpu_probe(void)
 {
