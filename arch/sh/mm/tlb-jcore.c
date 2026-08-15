@@ -330,14 +330,12 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
  * hardware primitive to pair with anyway and funnels straight here, and a
  * flush must never be cheaper than correct.
  *
- * SMP scope: this is the *local* flush, and the memset() is deliberately
- * held to the same local-only discipline as
- * jcore_tsb_flush_on_generation() below -- see the SMP-scope paragraph in
- * that function's comment. Single-core correctness is exact; a second CPU
- * concurrently walking the shared boot TSB while this memset() runs is
- * the same known hazard documented there, to be fixed at the same
- * cross-CPU broadcast point (flush_tlb_all()), not with an ad hoc IPI
- * here.
+ * SMP scope: this is the local flush and it now zeroes only THIS CPU's TSB
+ * row. That is complete rather than a compromise: every cross-CPU flush
+ * already runs local_flush_tlb_all() on each CPU through an IPI
+ * (arch/sh/kernel/smp.c flush_tlb_all/mm/range -> on_each_cpu), so each CPU
+ * invalidates its own TLB and its own TSB. The old shared-TSB race -- one
+ * CPU memset()ing rows another was walking -- is gone with the sharing.
  */
 void local_flush_tlb_all(void)
 {
@@ -355,7 +353,8 @@ void local_flush_tlb_all(void)
 	 * in kernel BSS (P1, untranslated), so the memset() itself cannot
 	 * recurse into a TLB miss.
 	 */
-	memset(jcore_boot_tsb, 0, JCORE_BOOT_TSB_BYTES);
+	memset(jcore_boot_tsb[raw_smp_processor_id()], 0,
+	       JCORE_BOOT_TSB_BYTES);
 	local_irq_restore(flags);
 }
 
@@ -400,5 +399,6 @@ void local_flush_tlb_one(unsigned long asid, unsigned long page)
 void jcore_tsb_flush_on_generation(unsigned long new_ctx)
 {
 	if (jcore_asid_gen_wrapped(new_ctx))
-		memset(jcore_boot_tsb, 0, JCORE_BOOT_TSB_BYTES);
+		memset(jcore_boot_tsb[raw_smp_processor_id()], 0,
+		       JCORE_BOOT_TSB_BYTES);
 }

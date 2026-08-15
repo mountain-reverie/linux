@@ -10,6 +10,7 @@
 
 #include <cpu/mmu_context.h>
 #include <asm/tlbflush.h>
+#include <linux/random.h>
 #include <linux/uaccess.h>
 #include <linux/mm_types.h>
 
@@ -225,9 +226,35 @@ static inline void enable_mmu(void)
 {
 	unsigned int cpu = smp_processor_id();
 
-	/* Enable MMU + flush TLB (AT=1 | TI=1) */
-	__raw_writel(MMUCR_AT | MMUCR_TI, MMUCR);
+	/*
+	 * Program this CPU's own TSB, then enable translation -- via the same
+	 * jcore_mmu_enable() head_32.S calls for CPU0, so there is exactly one
+	 * MMU-programming sequence in the tree and TSBBR/TSBCFG/ASIDR/PTEH/
+	 * MMUCR are always set as a group.
+	 *
+	 * This is what makes the per-CPU ASID namespace sound: a secondary
+	 * enters _stext and comes up on row 0 like everyone else, and this is
+	 * where it moves to its own row. That window is provably empty rather
+	 * than merely short -- the kernel is linked at PAGE_OFFSET +
+	 * __MEMORY_START = 0x90000000, which is P1 and untranslated, and
+	 * nothing between _stext and start_secondary() makes a P0/P3 access,
+	 * so no TSB row can have been created on row 0 by then.
+	 *
+	 * Re-running this on CPU0 from setup.c after head_32.S already ran it
+	 * is idempotent: same base, same TI pulse, same ASIDR = 0.
+	 */
+	jcore_mmu_enable((unsigned long)jcore_boot_tsb[cpu]);
 	ctrl_barrier();
+
+	/*
+	 * Seed this CPU's TSB victim LFSR. JCORE_TSB_VSEED is a per-core
+	 * register, so this cannot be a global initcall -- it used to be an
+	 * early_initcall in probe.c and therefore ran on CPU0 only, leaving
+	 * every secondary with an unseeded selector. Write-only in hardware;
+	 * the seed is never read back, which is the point (an open-source core
+	 * publishes the polynomial, so a recoverable seed is no seed at all).
+	 */
+	__raw_writel(get_random_u32(), (void __iomem *)JCORE_TSB_VSEED);
 
 	if (asid_cache(cpu) == NO_CONTEXT)
 		asid_cache(cpu) = MMU_CONTEXT_FIRST_VERSION;
