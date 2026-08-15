@@ -100,9 +100,23 @@
 #define JCORE_BOOT_TSB_BYTES	(JCORE_TSB_SET_BYTES << JCORE_BOOT_TSB_SIZE_LOG)
 
 #ifndef __ASSEMBLY__
-/* Defined in arch/sh/kernel/cpu/jcore/probe.c; consumed by tlb-jcore.c to
- * zero the boot TSB on ASID generation wrap (security-review S-I3). */
-extern char jcore_boot_tsb[JCORE_BOOT_TSB_BYTES];
+#include <linux/threads.h>
+
+/*
+ * Per-CPU TSBs, defined in arch/sh/kernel/cpu/jcore/probe.c. Row `cpu` is
+ * the TSB that CPU's TSBBR points at; see the comment there for why sharing
+ * one row across CPUs is a cross-address-space bug rather than a slowdown.
+ * Consumed by tlb-jcore.c's local_flush_tlb_all() and by enable_mmu().
+ */
+extern char jcore_boot_tsb[NR_CPUS][JCORE_BOOT_TSB_BYTES];
+
+/*
+ * arch/sh/kernel/cpu/jcore/mmu_enable.S. Programs TSBBR/TSBCFG from @tsb_base,
+ * zeroes ASIDR/PTEH, then enables translation and flushes the TLB in one
+ * MMUCR write. @tsb_base is a P1 KERNEL VIRTUAL address, aligned to its own
+ * size -- never a physical address; see the contract note in that file.
+ */
+void jcore_mmu_enable(unsigned long tsb_base);
 #endif /* __ASSEMBLY__ */
 
 #endif /* __ASM_CPU_JCORE_MMU_CONTEXT_H */

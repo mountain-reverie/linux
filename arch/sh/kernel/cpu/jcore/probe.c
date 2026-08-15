@@ -11,9 +11,12 @@
  * here to populate boot_cpu_data for /proc/cpuinfo and family dispatch
  * -- full capability-flag decoding is deferred to SP2/SP3 SMP bring-up.
  */
+#include <linux/build_bug.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/random.h>
+#include <linux/smp.h>
+#include <linux/threads.h>
 #include <asm/processor.h>
 #include <asm/cache.h>
 #include <cpu/mmu_context.h>
@@ -22,42 +25,73 @@
 #define JCORE_CPUINFO_MMIO	0xFF000020
 
 /*
- * Boot TSB (head_32.S's JCORE MMU-enable arm programs TSBBR/TSBCFG to
- * point here before setting MMUCR.AT). Lives in BSS, aligned to its own
- * size (8 KB = 256 32-byte 2-way sets) so head_32.S can just OR
- * TSB_SIZE_LOG into the low bits of its physical address without any
- * masking (hardware-spec.md §2.6).
+ * Per-CPU TSBs. One row per possible CPU, each pointed at by that CPU's own
+ * TSBBR (programmed in enable_mmu(), asm/mmu_context.h).
+ *
+ * These MUST NOT be shared. Linux allocates ASIDs per CPU -- asid_cache is
+ * per-CPU and cpu_context is indexed by cpu -- so two CPUs hand the same
+ * 12-bit ASID to different address spaces as a matter of course, both
+ * counters starting at version 1 and advancing in lockstep. A shared TSB
+ * turns that into a cross-address-space hit: the peer's row matches on both
+ * tag_hi and tag_lo and the walker installs its PTEL, with no exception and
+ * no diagnostic. Guarded by jcore-cpu sim/tests/dualcore/mmusmpasid.S, whose
+ * SHARED_TSB flavour is exactly this bug.
+ *
+ * Element size equals the alignment, so every row is individually aligned to
+ * JCORE_BOOT_TSB_BYTES and jcore_mmu_enable() can OR TSB_SIZE_LOG straight
+ * into the low bits of any of them. Adding a per-row header would silently
+ * break that.
+ *
+ * The name is deliberately unchanged from the old single-TSB days: three
+ * jcore-cpu cosim harnesses (sim/tests/mmulinux.S, mmulinuxexc.S, mmuhuge.S)
+ * define this symbol themselves to satisfy tlb-jcore.o, and head_32.S passes
+ * `jcore_boot_tsb` (= row 0) to jcore_mmu_enable() before any CPU numbering
+ * exists.
  */
-char jcore_boot_tsb[JCORE_BOOT_TSB_BYTES] __aligned(JCORE_BOOT_TSB_BYTES);
+char jcore_boot_tsb[NR_CPUS][JCORE_BOOT_TSB_BYTES]
+	__aligned(JCORE_BOOT_TSB_BYTES);
 
 /*
- * jcore_tsb_victim_seed_init() - hand the hardware TSB victim selector its
- * seed.
- *
- * The LFSR that nominates which way of a 2-way TSB set to replace has NO
- * seed of its own. That is deliberate: this is an open-source core, so a
- * constant compiled into the RTL would be published along with the
- * polynomial, and anyone could compute the eviction sequence offline.
- * Seeding it from the kernel RNG is what makes the sequence unavailable to
- * anyone who cannot already read kernel memory.
- *
- * JCORE_TSB_VSEED is write-only in hardware, and the seed is never read
- * back here -- it leaves this function and becomes unobservable.
- *
- * This lives here, not in arch/sh/mm/tlb-jcore.c, on purpose: the jcore-cpu
- * bare-metal cosim harnesses (sim/linux_sim.sh) link tlb-jcore.o directly
- * and would then need a get_random_u32() stub. probe.o is not in that link.
- *
- * An unseeded selector is not a correctness problem -- hardware self-heals
- * its all-zero LFSR state to a fixed constant, so both ways are still used,
- * just predictably until this initcall runs.
+ * Machine-check the geometry invariant the comment above documents: element
+ * size must equal JCORE_BOOT_TSB_BYTES for every row to land naturally
+ * aligned, and JCORE_BOOT_TSB_BYTES itself must be a power of two for
+ * jcore_mmu_enable() to OR TSB_SIZE_LOG straight into the low bits. A silent
+ * failure here leaves TSBBR pointing into garbage with no diagnostic.
  */
-static int __init jcore_tsb_victim_seed_init(void)
+static_assert(sizeof(jcore_boot_tsb[0]) == JCORE_BOOT_TSB_BYTES);
+static_assert((JCORE_BOOT_TSB_BYTES & (JCORE_BOOT_TSB_BYTES - 1)) == 0);
+
+/*
+ * Re-seed every online CPU's TSB victim LFSR once the kernel RNG has
+ * actually been initialised. enable_mmu() (asm/mmu_context.h) already seeds
+ * JCORE_TSB_VSEED for every CPU the moment its MMU comes up, so no CPU is
+ * ever left unseeded -- but CPU0's call happens from setup_arch(), before
+ * random_init_early()/random_init() have mixed in any entropy, and on a
+ * J-core FPGA target there is no RDSEED and no bootloader entropy to fall
+ * back on. This late_initcall re-draws a real seed for every online CPU
+ * (secondaries get a second, better draw too; that's harmless -- the
+ * register is write-only and re-seeding never weakens it).
+ *
+ * The bare-metal cosim harnesses link tlb-jcore.o and define their own
+ * jcore_boot_tsb stub directly (sim/tests/mmulinux.S etc.) -- they do not
+ * link this file, so nothing added here needs a harness-side stub.
+ */
+static void jcore_reseed_tsb_vseed(void *unused)
 {
 	__raw_writel(get_random_u32(), (void __iomem *)JCORE_TSB_VSEED);
+}
+
+static int __init jcore_reseed_tsb_vseed_init(void)
+{
+	/*
+	 * on_each_cpu() runs the callback on every online CPU, including the
+	 * caller, and works correctly under !CONFIG_SMP (it just calls the
+	 * function locally with interrupts disabled) -- no #ifdef needed.
+	 */
+	on_each_cpu(jcore_reseed_tsb_vseed, NULL, 1);
 	return 0;
 }
-early_initcall(jcore_tsb_victim_seed_init);
+late_initcall(jcore_reseed_tsb_vseed_init);
 
 void __ref cpu_probe(void)
 {

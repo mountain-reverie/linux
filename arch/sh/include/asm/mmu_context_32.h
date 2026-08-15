@@ -8,97 +8,38 @@
  * PTEH like SH-3/SH-4. Writes use LDC; reads use the read-only MMIO alias
  * at JCORE_ASIDR (0xFF000038) — `STC ASIDR,Rn` was retired with the other
  * six MMU read encodings once the hardware TSB walker made the software
- * fast path dead code (hardware-spec.md §2.1a, §3.1). ASIDR holds a 16-bit
- * ASID_TAG:
- *   bits [11:0]  = 12-bit ASID
- *   bits [15:12] = low 4 bits of the TLB generation/rollover counter
- * (linux-spec.md §5.2-5.3). ASID 0 is reserved for the kernel/global
- * mappings (_PAGE_GLOBAL suppresses the ASID compare in hardware).
+ * fast path dead code (hardware-spec.md §2.1a, §3.1). ASIDR holds a plain
+ * 12-bit ASID in bits [11:0]; bits [15:12] are always zero. ASID 0 is
+ * reserved for the kernel/global mappings (_PAGE_GLOBAL suppresses the
+ * ASID compare in hardware).
+ *
+ * ASIDR used to carry a 4-bit generation nibble in bits [15:12] so
+ * recycled 12-bit ASIDs could coexist in a shared TSB for 16 generations
+ * without false hits (security-review S-I3). That stopped isolating
+ * anything once local_flush_tlb_all() started zeroing the TSB on EVERY
+ * version wrap (the mitigation ran on an already-empty TSB), and per-CPU
+ * TSBs removed the cross-CPU sharing it was protecting in the first
+ * place, so the nibble was retired.
  */
-#define JCORE_ASID_GEN_SHIFT	12
-#define JCORE_ASID_GEN_BITS	4
-#define JCORE_ASID_GEN_MASK	((1U << JCORE_ASID_GEN_BITS) - 1)
-
-static inline u16 jcore_encode_asid_tag(u16 asid, u64 gen)
-{
-	return (asid & MMU_CONTEXT_ASID_MASK) |
-	       (((u32)(gen >> JCORE_ASID_GEN_SHIFT) & JCORE_ASID_GEN_MASK)
-			<< JCORE_ASID_GEN_SHIFT);
-}
-
-/*
- * True iff version bump lands gen_low back on 0 (every 16th rollover) --
- * point where gen_low nibble is about to be reused. Triggers TSB rebuild
- * to reject stale entries per security-review S-I3.
- */
-static inline bool jcore_asid_gen_wrapped(unsigned long ctx)
-{
-	return (((ctx >> JCORE_ASID_GEN_SHIFT) & JCORE_ASID_GEN_MASK) == 0);
-}
-
 static inline void set_asid(unsigned long asid)
 {
-	/*
-	 * Thread the current TLB generation (version nibble of the running
-	 * context) into ASID_TAG[15:12]. asid_cache(cpu) holds the full
-	 * cpu_context (asid | version<<12) for the CPU we are switching on:
-	 * activate_context()/switch_mm() set it (via get_mmu_context) before
-	 * calling set_asid. The generation-tagged tag lets recycled 12-bit
-	 * ASIDs coexist in the global TSB for 16 generations without false
-	 * hits; jcore_tsb_flush_on_generation() rebuilds the TSB on wrap
-	 * (security-review S-I3, hardware-spec §2.1a).
-	 *
-	 * Caveat: this composes asid_cache(cpu)'s CURRENT gen_low with the
-	 * *passed* asid, not the passed asid's own gen_low. That's exactly
-	 * right for activate_context()/switch_mm(). The tlbflush_32.c
-	 * save/restore dance instead does set_asid(saved_asid) where
-	 * saved_asid was captured by get_asid() (full tag, own gen_low) from
-	 * a *different* mm switched on the same cpu earlier -- so this
-	 * recomposes it with whatever gen_low is live now. That's harmless
-	 * today only because jcore's local_flush_tlb_one() is actually a
-	 * full local_flush_tlb_all() that ignores the programmed ASID_TAG
-	 * entirely; it would be a latent bug if local_flush_tlb_one() ever
-	 * became a tag-qualified single-entry invalidate.
-	 */
-	unsigned long gen = asid_cache(raw_smp_processor_id());
-	unsigned long tag = jcore_encode_asid_tag(asid, gen);
-
-	__asm__ __volatile__ ("ldc %0, asidr" : : "r" (tag));
+	__asm__ __volatile__ ("ldc %0, asidr"
+			      : : "r" (asid & MMU_CONTEXT_ASID_MASK));
 }
 
 static inline unsigned long get_asid(void)
 {
-	unsigned long tag;
-
 	/*
 	 * Read the P4 MMIO alias (0xFF000038) rather than STC ASIDR -- that
-	 * form is retiring (Phase 3, jcore-cpu task-1); the LDC write side
-	 * in set_asid() above is unaffected (D7).
+	 * form was retired with the other six MMU read encodings; the LDC
+	 * write side above is unaffected.
 	 *
-	 * This must read HARDWARE, not asid_cache(cpu): asid_cache(cpu)
-	 * tracks the full context of the mm currently ACTIVE on this CPU,
-	 * but set_asid()'s own comment records that tlbflush_32.c's save/
-	 * restore dance calls set_asid(saved_asid) with a tag captured by an
-	 * *earlier* get_asid() from a *different* mm, recomposed with
-	 * whatever gen_low happens to be live now. That is exactly a case
-	 * where the value ASIDR holds is not the running mm's asid_cache
-	 * entry, so asid_cache(cpu) is not an equivalent, cheaper substitute
-	 * here -- only the hardware register reflects what the last
-	 * set_asid() actually programmed.
+	 * This must read HARDWARE, not asid_cache(cpu): tlbflush_32.c's
+	 * save/restore-around-flush dance captures the ASID of one mm and
+	 * restores it later, so ASIDR does not always hold the running mm's
+	 * asid_cache entry.
 	 */
-	tag = __raw_readl(JCORE_ASIDR);
-	/*
-	 * Return the full 16-bit ASID_TAG (asid | gen_low<<12), not just the
-	 * 12-bit ASID: tlbflush_32.c saves this and restores it verbatim via
-	 * set_asid(), so gen_low must survive the round-trip.
-	 *
-	 * MMU_NO_ASID sentinel invariant: MMU_NO_ASID is 0x10000 (bit 16;
-	 * see mmu_context.h), which is unrepresentable in the 16-bit tag
-	 * returned here. Every possible saved_asid = get_asid() value is
-	 * therefore provably != MMU_NO_ASID, unconditionally -- no
-	 * reasoning about live user mm / asid != 0 is needed.
-	 */
-	return tag & 0xffff;
+	return __raw_readl(JCORE_ASIDR) & MMU_CONTEXT_ASID_MASK;
 }
 
 /*

@@ -12,16 +12,6 @@
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 
-/*
- * Generic no-op default: only jcore has a software TSB that can alias
- * across a reused ASID generation nibble (security-review S-I3). jcore
- * overrides this in arch/sh/mm/tlb-jcore.c (CONFIG_CPU_JCORE only); every
- * other 32-bit SH MMU build links this weak default instead.
- */
-void __weak jcore_tsb_flush_on_generation(unsigned long new_ctx)
-{
-}
-
 void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
 {
 	unsigned int cpu = smp_processor_id();
@@ -60,7 +50,20 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
 		size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
 		if (size > (MMU_NTLB_ENTRIES/4)) { /* Too many TLB to flush */
 			cpu_context(cpu, mm) = NO_CONTEXT;
-			if (mm == current->mm)
+			/*
+			 * active_mm, not mm: on the lazy-TLB path (kernel
+			 * thread, kthread_use_mm(), the OOM reaper) this mm is
+			 * still the one programmed into the ASID register even
+			 * though it is not current->mm. Revoking the context
+			 * without reprogramming would leave the CPU executing
+			 * on an ASID we just orphaned -- and the way back in
+			 * goes through switch_mm()'s prev == next arm, which
+			 * skips activate_context() because the mm_cpumask bit
+			 * is still set, so nothing downstream repairs it. For a
+			 * user task active_mm == mm, so this only adds the lazy
+			 * case.
+			 */
+			if (mm == current->active_mm)
 				activate_context(mm, cpu);
 		} else {
 			unsigned long asid;
@@ -124,7 +127,8 @@ void local_flush_tlb_mm(struct mm_struct *mm)
 
 		local_irq_save(flags);
 		cpu_context(cpu, mm) = NO_CONTEXT;
-		if (mm == current->mm)
+		/* active_mm, not mm -- see local_flush_tlb_range() above. */
+		if (mm == current->active_mm)
 			activate_context(mm, cpu);
 		local_irq_restore(flags);
 	}

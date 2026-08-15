@@ -300,6 +300,13 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 	 * is already present, so this cannot leave a stale duplicate of it
 	 * in the other way.
 	 */
+	/*
+	 * Deliberately a raw 32-bit read, not get_asid() (which returns only
+	 * the 12-bit ASID). tag_lo is compared full-width by the RTL, and
+	 * bits[15:12] are zero by construction here now that the generation
+	 * nibble set_asid() used to pack into them has been retired -- so the
+	 * two disagreeing about ASID_TAG's width is safe, not a live bug.
+	 */
 	asid_tag = __raw_readl(JCORE_ASIDR);
 	tsb_set = jcore_tsb_slot_addr(address);
 	jcore_tsb_write_entry(tsb_set, jcore_tsb_pick_way(tsb_set, pteh),
@@ -330,14 +337,12 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
  * hardware primitive to pair with anyway and funnels straight here, and a
  * flush must never be cheaper than correct.
  *
- * SMP scope: this is the *local* flush, and the memset() is deliberately
- * held to the same local-only discipline as
- * jcore_tsb_flush_on_generation() below -- see the SMP-scope paragraph in
- * that function's comment. Single-core correctness is exact; a second CPU
- * concurrently walking the shared boot TSB while this memset() runs is
- * the same known hazard documented there, to be fixed at the same
- * cross-CPU broadcast point (flush_tlb_all()), not with an ad hoc IPI
- * here.
+ * SMP scope: this is the local flush and it now zeroes only THIS CPU's TSB
+ * row. That is complete rather than a compromise: every cross-CPU flush
+ * already runs local_flush_tlb_all() on each CPU through an IPI
+ * (arch/sh/kernel/smp.c flush_tlb_all/mm/range -> on_each_cpu), so each CPU
+ * invalidates its own TLB and its own TSB. The old shared-TSB race -- one
+ * CPU memset()ing rows another was walking -- is gone with the sharing.
  */
 void local_flush_tlb_all(void)
 {
@@ -355,7 +360,8 @@ void local_flush_tlb_all(void)
 	 * in kernel BSS (P1, untranslated), so the memset() itself cannot
 	 * recurse into a TLB miss.
 	 */
-	memset(jcore_boot_tsb, 0, JCORE_BOOT_TSB_BYTES);
+	memset(jcore_boot_tsb[raw_smp_processor_id()], 0,
+	       JCORE_BOOT_TSB_BYTES);
 	local_irq_restore(flags);
 }
 
@@ -369,36 +375,4 @@ void local_flush_tlb_all(void)
 void local_flush_tlb_one(unsigned long asid, unsigned long page)
 {
 	local_flush_tlb_all();
-}
-
-/*
- * jcore_tsb_flush_on_generation() - overrides the generic __weak no-op
- * (arch/sh/mm/tlbflush_32.c) on CONFIG_CPU_JCORE.
- *
- * The boot TSB (jcore_boot_tsb) tags entries with only a 4-bit ASID
- * generation nibble (ASID_TAG[15:12], see JCORE_ASID_GEN_SHIFT/MASK in
- * asm/mmu_context_32.h), not the full MMU_CONTEXT version word. Every
- * 16th version rollover the generation nibble wraps back to 0 and is
- * reused, so any surviving TSB slot from up to 16 generations ago whose
- * (asid, gen_low) happens to match again would be a cross-tenant false
- * hit -- security-review S-I3. Zero the whole shared TSB on that wrap so
- * stale slots can never alias.
- *
- * SMP scope: called from get_mmu_context()'s version-wrap branch right
- * after local_flush_tlb_all() -- deliberately the *local* flush, not the
- * SMP-broadcast flush_tlb_all(). Each CPU wraps its own per-CPU
- * asid_cache independently, and jcore SMP has not (yet) wired a
- * cross-CPU broadcast for this path (SP2/SP3, see
- * arch/sh/kernel/cpu/jcore/probe.c). This memset() matches that same
- * local-only discipline rather than inventing a new broadcast/IPI here.
- * Single-core correctness is exact. If/when jcore SMP brings up
- * multiple CPUs concurrently walking the shared boot TSB, a wrap on one
- * CPU racing this memset() against another CPU's in-flight TSB
- * read/insert is a known hazard to revisit then -- it would need the
- * same broadcast point flush_tlb_all() uses, not an ad hoc IPI here.
- */
-void jcore_tsb_flush_on_generation(unsigned long new_ctx)
-{
-	if (jcore_asid_gen_wrapped(new_ctx))
-		memset(jcore_boot_tsb, 0, JCORE_BOOT_TSB_BYTES);
 }

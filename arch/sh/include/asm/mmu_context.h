@@ -10,6 +10,7 @@
 
 #include <cpu/mmu_context.h>
 #include <asm/tlbflush.h>
+#include <linux/random.h>
 #include <linux/uaccess.h>
 #include <linux/mm_types.h>
 
@@ -33,28 +34,14 @@
 #define MMU_CONTEXT_FIRST_VERSION	(MMU_CONTEXT_ASID_MASK + 1)
 
 /*
- * Impossible ASID value, to differentiate from NO_CONTEXT.
- *
- * This must fall outside the range of values get_asid() can ever return,
- * so it can be used as a "nothing captured yet / nothing to restore"
- * sentinel in tlbflush_32.c's save/restore-around-flush dance. Normally
- * that's satisfied by MMU_CONTEXT_FIRST_VERSION (one past the ASID mask).
- *
- * jcore is the exception: its get_asid() returns the full 16-bit hardware
- * ASID_TAG (asid[11:0] | gen_low[3:0]<<12), not just the 12-bit ASID, so
- * MMU_CONTEXT_FIRST_VERSION (0x1000) is itself a VALID 16-bit tag value
- * (asid=0, gen_low=1) -- indeed enable_mmu() programs ASIDR to exactly
- * 0x1000 at boot. Using it as the sentinel would let a legitimate captured
- * tag be mistaken for "nothing to restore". Widen the sentinel to
- * 0x10000 (bit 16 set), which no 16-bit ASID_TAG can ever equal.
- * MMU_CONTEXT_FIRST_VERSION itself stays 0x1000 (version 1) -- only the
- * sentinel used for the impossible-value check is decoupled here.
+ * Impossible ASID value, to differentiate from NO_CONTEXT. Must fall outside
+ * the range get_asid() can return, so it works as the "nothing captured yet"
+ * sentinel in tlbflush_32.c's save/restore-around-flush dance. One past the
+ * ASID mask satisfies that on every subtype, jcore included now that
+ * get_asid() returns a plain 12-bit ASID rather than a generation-tagged
+ * 16-bit ASID_TAG.
  */
-#ifdef CONFIG_CPU_JCORE
-#define MMU_NO_ASID			0x10000UL
-#else
 #define MMU_NO_ASID			MMU_CONTEXT_FIRST_VERSION
-#endif
 #define NO_CONTEXT			0UL
 
 #define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
@@ -73,15 +60,6 @@
 #include <asm/mmu_context_32.h>
 
 /*
- * jcore_tsb_flush_on_generation() - zero any software TSB whose stale
- * entries could alias against a reused ASID generation nibble
- * (security-review S-I3). Generic no-op default lives in
- * arch/sh/mm/tlbflush_32.c (linked into every 32-bit SH MMU build);
- * jcore overrides it in arch/sh/mm/tlb-jcore.c (CONFIG_CPU_JCORE only).
- */
-extern void jcore_tsb_flush_on_generation(unsigned long new_ctx);
-
-/*
  * Get MMU context if needed.
  */
 static inline void get_mmu_context(struct mm_struct *mm, unsigned int cpu)
@@ -96,38 +74,13 @@ static inline void get_mmu_context(struct mm_struct *mm, unsigned int cpu)
 	/* It's old, we need to get new context with new version. */
 	if (!(++asid & MMU_CONTEXT_ASID_MASK)) {
 		/*
-		 * We exhaust ASID of this version.
-		 * Flush all TLB and start new cycle.
-		 *
-		 * NOTE (jcore, SMP scope): this is local_flush_tlb_all(),
-		 * deliberately NOT the SMP-broadcast flush_tlb_all() --
-		 * each CPU wraps its own per-CPU asid_cache independently
-		 * and only needs to invalidate its own TLB. jcore SMP
-		 * bring-up (SP2/SP3, see arch/sh/kernel/cpu/jcore/probe.c)
-		 * has not wired a cross-CPU broadcast for this path, so
-		 * jcore_tsb_flush_on_generation() below matches the SAME
-		 * local-only discipline rather than inventing a new
-		 * broadcast/IPI mechanism. On single-core this is exact.
-		 * If/when jcore SMP lands with multiple CPUs concurrently
-		 * walking the shared boot TSB, a wrap on one CPU racing a
-		 * memset() with another CPU's in-flight TSB read/insert
-		 * is a known hazard to revisit at that point (it would
-		 * need the same broadcast point flush_tlb_all() gets, not
-		 * an ad hoc IPI here).
+		 * ASID space exhausted: flush this CPU's TLB and TSB and start
+		 * a new version. Local, not the SMP-broadcast flush_tlb_all():
+		 * each CPU wraps its own asid_cache and owns its own TLB and
+		 * its own TSB row, so there is nothing on another CPU that this
+		 * wrap invalidates.
 		 */
 		local_flush_tlb_all();
-		/*
-		 * Called with the PRE-fixup asid on purpose. On a normal
-		 * generation wrap asid != 0 and the version-0 fixup below is a
-		 * no-op, so pre/post are identical. But on a full 32-bit wrap
-		 * (asid == 0) the pre-fixup value has gen_low == 0, so
-		 * jcore_asid_gen_wrapped() zeros the TSB -- which is exactly
-		 * right, since a full wrap restarts the version numbering and
-		 * every old TSB entry is now aliasable. The post-fixup value
-		 * (MMU_CONTEXT_FIRST_VERSION, gen_low == 1) would MISS that case.
-		 * Do not move this below the fixup.
-		 */
-		jcore_tsb_flush_on_generation(asid);
 
 		/*
 		 * Fix version; Note that we avoid version #0
@@ -176,9 +129,21 @@ static inline void switch_mm(struct mm_struct *prev,
 		cpumask_set_cpu(cpu, mm_cpumask(next));
 		set_TTB(next->pgd);
 		activate_context(next, cpu);
-	} else
+	} else {
 		if (!cpumask_test_and_set_cpu(cpu, mm_cpumask(next)))
 			activate_context(next, cpu);
+		else
+			/*
+			 * The arm that reprograms nothing. Reaching it with a
+			 * revoked context means we are about to run on an ASID
+			 * some earlier local_flush_tlb_mm()/_range() orphaned
+			 * -- the lazy-TLB hole those two now close by keying on
+			 * active_mm. Unreachable once they do; kept as the
+			 * tripwire for a regression, since the failure is
+			 * otherwise silent (stale translations, no fault).
+			 */
+			VM_WARN_ON_ONCE(cpu_context(cpu, next) == NO_CONTEXT);
+	}
 }
 
 #include <asm-generic/mmu_context.h>
@@ -213,9 +178,44 @@ static inline void enable_mmu(void)
 {
 	unsigned int cpu = smp_processor_id();
 
-	/* Enable MMU + flush TLB (AT=1 | TI=1) */
-	__raw_writel(MMUCR_AT | MMUCR_TI, MMUCR);
+	/*
+	 * Program this CPU's own TSB, then enable translation -- via the same
+	 * jcore_mmu_enable() head_32.S calls for CPU0, so there is exactly one
+	 * MMU-programming sequence in the tree and TSBBR/TSBCFG/ASIDR/PTEH/
+	 * MMUCR are always set as a group.
+	 *
+	 * This is what makes the per-CPU ASID namespace sound: a secondary
+	 * enters _stext and comes up on row 0 like everyone else, and this is
+	 * where it moves to its own row. That window is provably empty rather
+	 * than merely short -- the kernel is linked at PAGE_OFFSET +
+	 * __MEMORY_START = 0x90000000, which is P1 and untranslated, and
+	 * nothing between _stext and start_secondary() makes a P0/P3 access,
+	 * so no TSB row can have been created on row 0 by then.
+	 *
+	 * Re-running this on CPU0 from setup.c after head_32.S already ran it
+	 * is idempotent: same base, same TI pulse, same ASIDR = 0.
+	 */
+	jcore_mmu_enable((unsigned long)jcore_boot_tsb[cpu]);
 	ctrl_barrier();
+
+	/*
+	 * Seed this CPU's TSB victim LFSR. JCORE_TSB_VSEED is a per-core
+	 * register, so this cannot be a global initcall -- it used to be an
+	 * early_initcall in probe.c and therefore ran on CPU0 only, leaving
+	 * every secondary with an unseeded selector. Write-only in hardware;
+	 * the seed is never read back, which is the point (an open-source core
+	 * publishes the polynomial, so a recoverable seed is no seed at all).
+	 *
+	 * This is only a BEST-EFFORT boot seed: enable_mmu() for CPU0 runs from
+	 * setup_arch(), which init/main.c calls BEFORE random_init_early() and
+	 * random_init(), so get_random_u32() here draws on essentially no mixed-in
+	 * entropy yet. Every CPU still gets *some* seed the instant its MMU comes
+	 * up -- no CPU is ever left unseeded -- but the real, well-mixed seed
+	 * lands later via jcore_reseed_tsb_vseed(), a late_initcall in
+	 * arch/sh/kernel/cpu/jcore/probe.c that re-seeds every online CPU once
+	 * random_init() has actually run.
+	 */
+	__raw_writel(get_random_u32(), (void __iomem *)JCORE_TSB_VSEED);
 
 	if (asid_cache(cpu) == NO_CONTEXT)
 		asid_cache(cpu) = MMU_CONTEXT_FIRST_VERSION;
