@@ -176,9 +176,21 @@ static inline void switch_mm(struct mm_struct *prev,
 		cpumask_set_cpu(cpu, mm_cpumask(next));
 		set_TTB(next->pgd);
 		activate_context(next, cpu);
-	} else
+	} else {
 		if (!cpumask_test_and_set_cpu(cpu, mm_cpumask(next)))
 			activate_context(next, cpu);
+		else
+			/*
+			 * The arm that reprograms nothing. Reaching it with a
+			 * revoked context means we are about to run on an ASID
+			 * some earlier local_flush_tlb_mm()/_range() orphaned
+			 * -- the lazy-TLB hole those two now close by keying on
+			 * active_mm. Unreachable once they do; kept as the
+			 * tripwire for a regression, since the failure is
+			 * otherwise silent (stale translations, no fault).
+			 */
+			VM_WARN_ON_ONCE(cpu_context(cpu, next) == NO_CONTEXT);
+	}
 }
 
 #include <asm-generic/mmu_context.h>
