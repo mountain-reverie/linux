@@ -65,7 +65,10 @@ static inline unsigned long jcore_read_tsbptr(void)
  * @set:      byte address of the 32-byte, 2-way TSB SET (from TSBPTR or
  *            JCORE_TSB_SLOT -- hardware now returns a set, not an entry).
  * @way:      which way of the set to write; see jcore_tsb_pick_way().
- * @vpn:      tag_hi -- the faulting VPN (page-aligned address).
+ * @vpn:      tag_hi -- the CANONICAL 4 KB VPN of the faulting address,
+ *            i.e. `addr & JCORE_TSB_TAG_MASK`. NOT `addr & PAGE_MASK`, and
+ *            not a function of the page size the entry describes; see
+ *            JCORE_TSB_TAG_MASK in <cpu/mmu_context.h>.
  * @asid_tag: tag_lo -- the ASID_TAG this entry is valid for.
  * @ptel:     data -- the hardware PTEL image.
  */
@@ -88,6 +91,13 @@ static inline void jcore_tsb_write_entry(unsigned long set,
  *
  * The rule is: if either way already holds this VPN, OVERWRITE THAT WAY.
  * Only when neither matches do we take the hardware's victim nomination.
+ *
+ * The search is EXACT EQUALITY and must stay that way (contract K2). It is
+ * correct across page sizes and across size transitions precisely because
+ * @vpn is the canonical 4 KB tag -- a total function of the address alone --
+ * so "the way holding this VPN" is well defined at every instant. A masked or
+ * size-aware search here would be a symptom that someone had reintroduced a
+ * size-dependent tag somewhere.
  *
  * This is not an optimisation and must not be "optimised" into always
  * taking the victim. Overwriting the matching way is what makes a stale
@@ -136,8 +146,9 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  * @pgd:       root of the page table to walk (current_pgd, stashed in the
  *             MMU_TTB scratch MMIO register by switch_mm()/set_TTB()).
  * @addr:      faulting address (read from MMU_TEA by the asm caller).
- * @pteh_tag:  the expected ASID_TAG (TSB tag_lo) for this walk -- read
- *             from ASIDR by the asm caller, passed through unchanged.
+ * @asid_tag:  the expected ASID_TAG (TSB tag_lo) for this walk -- read
+ *             from ASIDR by the asm caller, passed through unchanged. It
+ *             becomes tag_lo; tag_hi is computed here from @addr.
  *
  * Two-level walk (pgd -> pte); intermediate pud_offset()/pmd_offset()
  * calls fold away via the generic <asm-generic/pgtable-nop{ud,md}.h>
@@ -154,7 +165,7 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  * On failure (not present, or software PROTNONE/STALE marker set):
  * returns nonzero; the caller falls through to the generic fault path.
  */
-int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
+int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long asid_tag)
 {
 	p4d_t *p4d;
 	pud_t *pud;
@@ -164,6 +175,14 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 	unsigned long ptel;
 	unsigned long tsb_set;
 	unsigned long vpn;
+
+	/*
+	 * jcore_pte_to_ptel() below is only correct at PAGE_SHIFT 14: at 12 the
+	 * PFN overlaps the pte's page-size slot. arch/sh/mm/Kconfig makes that
+	 * configuration unselectable and carries the full argument; this catches
+	 * a hand-edited .config. docs/mmu/pagemask-walker-contract.md K3.
+	 */
+	BUILD_BUG_ON(PAGE_SHIFT != 14);
 
 	pgd += pgd_index(addr);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
@@ -197,10 +216,19 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
 
 	ptel = jcore_pte_to_ptel(pte_val(entry));
 
-	vpn = addr & PAGE_MASK;
+	/*
+	 * CANONICAL 4 KB TAG -- never PAGE_MASK. The hardware walker compares
+	 * tag_hi against the RAW faulting VA at 4 KB granularity with an exact
+	 * 32-bit equality, for every page size; a 16 KB-aligned tag can never
+	 * match a first touch outside the page's base 4 KB sub-page and the
+	 * fault repeats forever. See JCORE_TSB_TAG_MASK in
+	 * <cpu/mmu_context.h> and docs/mmu/pagemask-walker-contract.md C1/C2.
+	 * The entry's page size travels in @ptel (PTEL[11:8]) and nowhere else.
+	 */
+	vpn = addr & JCORE_TSB_TAG_MASK;
 	tsb_set = jcore_read_tsbptr();
 	jcore_tsb_write_entry(tsb_set, jcore_tsb_pick_way(tsb_set, vpn),
-			      vpn, pteh_tag, ptel);
+			      vpn, asid_tag, ptel);
 
 	return 0;
 }
@@ -217,9 +245,16 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long pteh_tag)
  * Note VA[31:12] is a *fixed* 12-bit shift in hardware, NOT PAGE_SHIFT:
  * hardware hashes 4 KB-granular page numbers regardless of the kernel's
  * 16 KB base page size, so the four 4 KB-granular VAs inside one 16 KB
- * page can land in four different slots. That only ever costs a
- * fast-path miss (the slot tags are still compared), never a wrong
- * translation -- the TSB is a hint cache, not an authority.
+ * page can land in four different sets.
+ *
+ * That is exactly why the TAG is 4 KB-granular too (JCORE_TSB_TAG_MASK):
+ * index granularity and tag granularity are one architectural constant, and
+ * neither may be a function of the entry's page size. The cost is that a page
+ * larger than 4 KB owns one row per TOUCHED 4 KB sub-page, in different sets;
+ * that is never a correctness cost, because every such row carries the
+ * identical data word. It is a hint cache, not an authority -- but only for
+ * as long as the rows in it are not stale, which is what the memset() in
+ * local_flush_tlb_all() below is for.
  *
  * ADDRESS SPACE -- why dereferencing this return value is correct.
  *
@@ -289,7 +324,17 @@ void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
 
 	local_irq_save(flags);
 
-	pteh = address & PAGE_MASK;
+	/*
+	 * Same canonical 4 KB tag as __jcore_tlb_walk() -- never PAGE_MASK.
+	 * See JCORE_TSB_TAG_MASK in <cpu/mmu_context.h>.
+	 *
+	 * For hugetlb, generic mm hands this function the huge-ALIGNED address,
+	 * so only that sub-page's set is primed. That is correct-but-partial and
+	 * must stay that way (contract K8): every other sub-page is covered on
+	 * demand by the slow path, and filling the whole span would be one row
+	 * per 4 KB sub-page -- 65536 rows into a 512-row TSB for a 256 MB page.
+	 */
+	pteh = address & JCORE_TSB_TAG_MASK;
 	ptel = jcore_pte_to_ptel(pte_val(pte));
 
 	/*
@@ -371,6 +416,16 @@ void local_flush_tlb_all(void)
  * full flush; SP2/SP3 can revisit this if TLB-flush-storm cost from
  * unmap()/mprotect() hot loops (tlbflush_32.c's local_flush_tlb_range()/
  * local_flush_tlb_kernel_range()) turns out to matter in practice.
+ *
+ * IF THAT REVISIT HAPPENS, note there is no such thing as a per-page TSB
+ * invalidate for a page larger than 4 KB (contract K4). Because the TSB tag
+ * and index are both 4 KB-granular (JCORE_TSB_TAG_MASK), one page owns up to
+ * one row per TOUCHED 4 KB sub-page, in different sets. A targeted
+ * invalidation must therefore either stay a whole-TSB flush -- what
+ * local_flush_tlb_all() does -- or iterate every 4 KB sub-page of the range.
+ * Zeroing "the row for @page" would strand every other sub-page's row, and
+ * a stranded row is a stale TRANSLATION the walker installs without ever
+ * consulting software, not a stale hint.
  */
 void local_flush_tlb_one(unsigned long asid, unsigned long page)
 {
