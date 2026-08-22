@@ -68,6 +68,24 @@
 #define JCORE_TSB_ENTRY_BYTES	16
 #define JCORE_TSB_SET_BYTES	(JCORE_TSB_WAYS * JCORE_TSB_ENTRY_BYTES)
 
+/*
+ * TSB tags AND the TSB set index are BOTH at the architecture's finest page
+ * granularity (4 KB), independent of PAGE_SIZE and of the size of the page
+ * the entry describes.  Do NOT substitute PAGE_MASK.
+ * docs/mmu/pagemask-walker-contract.md C1/C2; hardware-spec.md §7.0a;
+ * linux-spec.md §4.3a.
+ *
+ * WHY IT CANNOT BE PAGE_MASK. The hardware walker compares tag_hi against the
+ * RAW faulting VA with an exact 32-bit equality, for every page size, so a
+ * PAGE_MASK-aligned tag under PAGE_SHIFT=14 can never match a first touch
+ * outside a page's base 4 KB sub-page and the fault repeats forever.  The
+ * read-order and index-granularity reasons it must stay that way, and the
+ * one-row-per-touched-sub-page cost that follows, are in the contract (C1,
+ * C2, C7).  Guards: jcore-cpu sim/tests/mmupmsub4k.S, mmupmsubi.S, mmupmmix.S.
+ */
+#define JCORE_TSB_TAG_SHIFT	12
+#define JCORE_TSB_TAG_MASK	(~((1UL << JCORE_TSB_TAG_SHIFT) - 1))
+
 /* MMUCR bit layout (hardware-spec.md §2.3) */
 #define MMUCR_AT	(1 << 0)	/* Address Translation enable */
 #define MMUCR_TI	(1 << 2)	/* TLB flush strobe (write-1) */

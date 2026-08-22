@@ -4,7 +4,22 @@ menu "Memory management options"
 config MMU
         bool "Support for memory management hardware"
 	depends on !CPU_SH2 || CPU_JCORE
-	select HAVE_PAGE_SIZE_4KB
+	# 4 KB base pages are NOT selectable on an MMU-enabled J-core kernel.
+	# The jcore pte packs its 3-bit page-size slot into bits {10,12,13}
+	# (_PAGE_JCORE_SZ_BITS), which is only free while PFN_PTE_SHIFT
+	# (== PAGE_SHIFT) is 14. At PAGE_SHIFT 12 the PFN lands on top of
+	# SZ1/SZ2, so jcore_pte_to_ptel() reads frame bits as the page size --
+	# emitting arbitrary PageMask values, including the reserved >= 9 ones
+	# that install a wildcard TLB entry -- and its `ppn = pte_val & ~0x3FFF`
+	# discards PA[13:12]. Total breakage, and it used to be silently
+	# selectable. arch/sh/mm/tlb-jcore.c carries the matching
+	# BUILD_BUG_ON(PAGE_SHIFT != 14), so hand-editing a .config does not
+	# get round this either.
+	#
+	# This constrains the KERNEL only. PageMask 0 (4 KB) is a fully
+	# supported J4 hardware page size and its RTL path must keep working.
+	# docs/mmu/pagemask-walker-contract.md K3; linux-spec.md §4.3a.
+	select HAVE_PAGE_SIZE_4KB if !CPU_JCORE
 	select HAVE_PAGE_SIZE_8KB if X2TLB
 	select HAVE_PAGE_SIZE_16KB if CPU_JCORE
 	select HAVE_PAGE_SIZE_64KB if CPU_SH4
