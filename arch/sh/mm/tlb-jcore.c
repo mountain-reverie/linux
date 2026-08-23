@@ -170,38 +170,26 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  * aligning @addr down by that size lands on the page containing it and two
  * mappings cannot cover one address.
  *
- * Cost: a base mapping matches at s = 0, so the hot path is unchanged
- * except for one equality test. Only a huge mapping, or an address with no
- * mapping at all, pays for further probes -- bounded at eight, on a path
- * that is already an exception.
+ * Cost: a base mapping matches at s = 0, so the hot path grows only the
+ * size-slot extraction -- jcore_pte_size_slot() is three shifts, two masks
+ * and two ORs, plus the compare; call it ~6 instructions, not "one equality
+ * test" as an earlier version of this comment claimed. Only a huge mapping,
+ * or an address with no mapping at all, pays for further probes -- bounded
+ * at eight, on a path that is already an exception.
+ *
+ * @out receives the pte VALUE this function validated. Callers must use that
+ * value and must NOT re-read *ptep: see the TOCTOU note at the read below.
  *
  * NOT REDUNDANT WITH THE PTE REPLICATION in arch/sh/mm/hugetlbpage.c, which
  * would also let a raw-index probe find a usable pte. What this adds is that
  * the walker resolves at the HEAD slot, so the _PAGE_ACCESSED write-back
- * below lands on the entry huge_ptep_get() reads. Two reasons that matters,
- * in increasing order of force:
- *
- *   1. It keeps every hugetlb_fault() cheap. mm/hugetlb.c:6098 does
- *      `vmf.orig_pte = pte_mkyoung(vmf.orig_pte)` on a value read from the
- *      HEAD and hands it to huge_ptep_set_access_flags(). Mark some other
- *      slot instead and the head is never young, so pte_same() is false on
- *      EVERY fault and the whole run gets rewritten -- 16384 set_pte_at()
- *      plus a 256 MB flush_tlb_range(), per fault. (An earlier version of
- *      this comment claimed the cost was reclaim ageing. It is not:
- *      there is no huge_ptep_test_and_clear_young() or
- *      huge_ptep_clear_flush_young() on this tree, mm/hugetlb.c reads
- *      pte_young() nowhere, and hugetlb folios are not on the LRU.)
- *
- *   2. It is the only half of the K7 fix a running test can reach. The
- *      replication lives in generic-mm-facing hooks that no bare-metal
- *      harness can drive; this function is linked directly by jcore-cpu's
- *      sim/tests/mmuhugefar.S, which goes red without it. Shipping
- *      replication alone would mean shipping a livelock fix with no
- *      executed evidence behind it.
- *
- * See the comment in <asm/hugetlb.h>.
+ * lands on the entry huge_ptep_get() reads -- which keeps every
+ * hugetlb_fault() cheap, and is the only half of the K7 fix a running test
+ * can reach. The full argument lives in <asm/hugetlb.h> and is deliberately
+ * NOT duplicated here; when it changed, both copies had to be rewritten in
+ * one commit, which was the maintenance cost demonstrating itself.
  */
-static pte_t *jcore_walk_pte(pgd_t *pgd_base, unsigned long addr)
+static pte_t *jcore_walk_pte(pgd_t *pgd_base, unsigned long addr, pte_t *out)
 {
 	/*
 	 * @mask is the in-page offset mask for the slot being probed, grown
@@ -215,13 +203,15 @@ static pte_t *jcore_walk_pte(pgd_t *pgd_base, unsigned long addr)
 	unsigned long mask = PAGE_SIZE - 1;
 	unsigned int slot;
 
-	for (slot = 0; slot < 8; slot++, mask = (mask << 2) | 3) {
+	for (slot = 0; slot < ARRAY_SIZE(jcore_pm_for_slot);
+	     slot++, mask = (mask << 2) | 3) {
 		unsigned long a = addr & ~mask;
 		pgd_t *pgd = pgd_base + pgd_index(a);
 		p4d_t *p4d;
 		pud_t *pud;
 		pmd_t *pmd;
 		pte_t *ptep;
+		pte_t pte;
 
 		/*
 		 * A missing level is not fatal here the way it was when this
@@ -247,17 +237,45 @@ static pte_t *jcore_walk_pte(pgd_t *pgd_base, unsigned long addr)
 		ptep = pte_offset_kernel(pmd, a);
 
 		/*
-		 * _PAGE_VALID first, and only then the size slot. The swap /
-		 * migration-entry encoding lays its offset over pte bits
-		 * 11..31, which includes the size-slot bits {12,13}, so the
-		 * "slot" of a non-present pte is not a size and must never be
-		 * compared against one.
+		 * READ ONCE, CHECK AND RETURN THAT VALUE. This must not become
+		 * two reads with the caller re-dereferencing ptep, and it was
+		 * briefly written that way. On SMP a concurrent
+		 * zap_pte_range() holds nothing this path respects, so it can
+		 * land between the validating read and a second one. The
+		 * caller would then see a cleared pte, find _PAGE_PROTNONE and
+		 * _PAGE_STALE both clear, return 0 for "resolved", write a
+		 * V=0 PTEL into the TSB under a MATCHING tag, and -- worse --
+		 * jcore_tlb_walk_mark_accessed() would store
+		 * `0 | _PAGE_ACCESSED` back over the slot mm had just cleared,
+		 * resurrecting a bogus non-none pte in a live page table.
+		 * Handing the validated value out through @out keeps the
+		 * original one-read-checked-and-used property.
+		 *
+		 * _PAGE_VALID first, and only then the size slot -- see the
+		 * size-slot note below for why the order is not optional.
 		 */
-		if (!(pte_val(*ptep) & _PAGE_VALID))
+		pte = ptep_get(ptep);
+
+		/*
+		 * THE SIZE SLOT IS 3 BITS, at pte {10,12,13}
+		 * (_PAGE_JCORE_SZ_BITS, <asm/pgtable-bits-jcore.h>), giving
+		 * the eight-entry ladder jcore_pm_for_slot[] maps to hardware
+		 * PageMask 1..8 -- which is why this loop runs to
+		 * ARRAY_SIZE(jcore_pm_for_slot) and not to 4.
+		 *
+		 * On a NON-PRESENT pte that field is meaningless, so the
+		 * _PAGE_VALID test above has to come first. The swap encoding
+		 * (arch/sh/include/asm/pgtable_32.h) puts the swap offset in
+		 * pte bits 11..31, which covers 12 and 13; bit 10 is always
+		 * zero there. So a swap/migration pte's "slot" is neither a
+		 * size nor even a stable value -- it is two offset bits.
+		 */
+		if (!(pte_val(pte) & _PAGE_VALID))
 			continue;
-		if (jcore_pte_size_slot(pte_val(*ptep)) != slot)
+		if (jcore_pte_size_slot(pte_val(pte)) != slot)
 			continue;
 
+		*out = pte;
 		return ptep;
 	}
 
@@ -309,7 +327,11 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long asid_tag)
 	BUILD_BUG_ON(PAGE_SHIFT != 14);
 
 	/*
-	 * Finest-first, size-slot-checked; _PAGE_VALID is checked inside.
+	 * Finest-first, size-slot-checked; _PAGE_VALID is checked inside, and
+	 * @entry is the value that was checked. Do NOT re-read *ptep here --
+	 * that reintroduces a TOCTOU against a concurrent zap_pte_range();
+	 * see the note in jcore_walk_pte().
+	 *
 	 * NOT pte_offset_kernel(pmd, addr) -- see jcore_walk_pte() for why
 	 * the raw pte index is the wrong slot for every huge mapping past its
 	 * first PAGE_SIZE, and what that costs (an unbounded fault loop).
@@ -318,11 +340,9 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long asid_tag)
 	 * once per probed slot), so `pgd` is passed as the BASE and must not
 	 * be pre-incremented here the way the old open-coded walk did.
 	 */
-	ptep = jcore_walk_pte(pgd, addr);
+	ptep = jcore_walk_pte(pgd, addr, &entry);
 	if (!ptep)
 		return -EFAULT;
-
-	entry = *ptep;
 
 	if (pte_val(entry) & (_PAGE_PROTNONE | _PAGE_STALE))
 		return -EFAULT;	/* prot-none, or lazy-shootdown stale */

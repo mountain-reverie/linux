@@ -28,25 +28,51 @@
  * set_huge_pte_at() below and the rationale in <asm/hugetlb.h>), so every
  * table the span crosses has to exist, not just the one holding the head.
  *
- * At PAGE_SHIFT 14 one pte table covers PTRS_PER_PTE (4096) * 16 KB = 64 MB,
- * which is exactly PGDIR_SIZE (PGDIR_SHIFT = PTE_SHIFT + PTE_BITS = 26,
- * arch/sh/include/asm/pgtable-2level.h). Every registered huge size up to
- * 64 MB is therefore aligned inside a single table; only the 256 MB size
- * crosses one, and it crosses exactly four, entering each at index 0.
+ * ONE PTE TABLE SPANS EXACTLY PMD_SIZE. That is an identity of the layout,
+ * not arithmetic that happens to work out at 16 KB: PTRS_PER_PTE is
+ * PAGE_SIZE >> PTE_MAGNITUDE, so PTRS_PER_PTE * PAGE_SIZE is
+ * 1 << (2*PAGE_SHIFT - PTE_MAGNITUDE) -- which is precisely PMD_SHIFT's
+ * definition under pgtable-3level.h, and equals PGDIR_SIZE under
+ * pgtable-2level.h because PGDIR_SHIFT there is defined as
+ * PTE_SHIFT + PTE_BITS. It holds at any PAGE_SHIFT and at either depth.
+ *
+ * Concretely here: PAGE_SHIFT 14, PTRS_PER_PTE 4096, one table covers 64 MB.
+ * Every registered huge size up to 64 MB is aligned inside a single table;
+ * only 256 MB crosses, and it crosses exactly four, entering each at index 0.
+ *
+ * The stride below is therefore PMD_SIZE and NOT PGDIR_SIZE. They are equal
+ * for jcore -- asm-generic/pgtable-nopmd.h folds pmd onto pgd, so the emitted
+ * code is byte-identical today -- but under pgtable-3level.h PGDIR_SHIFT is
+ * 30 with a real pmd, one pgd entry spans many pte tables, and a PGDIR_SIZE
+ * stride would silently skip every table in between. PMD_SIZE is the constant
+ * this invariant is actually about.
+ *
+ * The same identity is what makes huge_pte_step()'s `pte_index(addr) == 0`
+ * test mean "we have entered a new table" rather than "we have wrapped inside
+ * the current one".
+ *
+ * NOTE FOR NON-JCORE SH: this function is shared, but only jcore replicates
+ * (set_huge_pte_at() is the generic single-slot one elsewhere), so only the
+ * head table is ever used there. @span keeps the loop to one iteration for
+ * those configs rather than allocating tables they will never populate -- on
+ * a 4 KB/2-level SH-4 with 64 MB hugepages the full span would be 16 empty
+ * tables per mapping. Harmless (empty tables are not mappings and are freed
+ * with the mm) but a pointless behaviour change for configs this series never
+ * builds or tests, so it is avoided rather than merely documented.
  *
  * Returns the HEAD slot -- the one at @addr -- which is what every generic
  * caller then passes around. A failure part-way through leaves the earlier
- * tables allocated; that is harmless (they are freed with the mm, and an
- * empty pte table is not a mapping) and matches how every other partial
- * page-table allocation in the tree behaves.
+ * tables allocated; that is harmless for the same reason and matches how
+ * every other partial page-table allocation in the tree behaves.
  */
 pte_t *huge_pte_alloc(struct mm_struct *mm, struct vm_area_struct *vma,
 			unsigned long addr, unsigned long sz)
 {
+	unsigned long span = IS_ENABLED(CONFIG_CPU_JCORE) ? sz : PAGE_SIZE;
 	pte_t *head = NULL;
 	unsigned long a;
 
-	for (a = addr; a < addr + sz; a = (a & PGDIR_MASK) + PGDIR_SIZE) {
+	for (a = addr; a < addr + span; a = (a & PMD_MASK) + PMD_SIZE) {
 		pgd_t *pgd = pgd_offset(mm, a);
 		p4d_t *p4d;
 		pud_t *pud;
@@ -125,7 +151,16 @@ pte_t *huge_pte_offset(struct mm_struct *mm,
  *
  * A run may cross a pte table boundary -- only the 256 MB size does, four
  * tables' worth -- so nothing may walk off the end of one table with ptep++.
- * huge_pte_step() re-walks whenever the address enters a new table.
+ * huge_pte_step() re-walks whenever the address enters a new table; see
+ * huge_pte_alloc() above for why `pte_index(addr) == 0` is exactly that test.
+ *
+ * EVERY RUN WALKER BELOW GOES HEAD-FIRST, AND THAT IS DELIBERATE. The TLB-miss
+ * walker resolves at the head (arch/sh/mm/tlb-jcore.c jcore_walk_pte()), so
+ * once slot 0 has been cleared or write-protected, no new valid/writable TLB
+ * entry can be installed for ANY address in the run -- even while the tail is
+ * momentarily still stale. Reversing any of these loops would open a window in
+ * which the head still authorises installs that the tail no longer backs.
+ * Do not "optimise" one into counting downwards.
  */
 static pte_t *huge_pte_step(struct mm_struct *mm, unsigned long addr,
 			    pte_t *ptep)
@@ -136,10 +171,13 @@ static pte_t *huge_pte_step(struct mm_struct *mm, unsigned long addr,
 }
 
 /*
- * The huge page size a PRESENT pte describes. Only ever call this on a
- * present pte: the swap/marker encoding lays the swap offset over pte bits
- * 11..31, which includes the size-slot bits {12,13}, so the "slot" of a
- * non-present pte is not a size at all.
+ * The huge page size a PRESENT pte describes.
+ *
+ * The size slot is 3 bits, at pte {10,12,13} (_PAGE_JCORE_SZ_BITS), indexing
+ * the eight-entry jcore_pm_for_slot[] ladder -- NOT a 2-bit field. Only ever
+ * call this on a present pte; the canonical explanation of why a non-present
+ * pte's slot is neither a size nor a stable value is at the size-slot note in
+ * arch/sh/mm/tlb-jcore.c's jcore_walk_pte().
  */
 static inline unsigned long huge_pte_size(pte_t pte)
 {
@@ -157,7 +195,7 @@ void set_huge_pte_at(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
 		if (i) {
 			addr += PAGE_SIZE;
 			ptep = huge_pte_step(mm, addr, ptep);
-			if (!ptep)
+			if (WARN_ON_ONCE(!ptep))
 				return;
 			/*
 			 * Each slot names its OWN base page. That is what
@@ -190,7 +228,7 @@ void huge_pte_clear(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
 		if (i) {
 			addr += PAGE_SIZE;
 			ptep = huge_pte_step(mm, addr, ptep);
-			if (!ptep)
+			if (WARN_ON_ONCE(!ptep))
 				return;
 		}
 		pte_clear(mm, addr, ptep);
@@ -231,7 +269,7 @@ void huge_ptep_set_wrprotect(struct mm_struct *mm, unsigned long addr,
 		if (i) {
 			addr += PAGE_SIZE;
 			ptep = huge_pte_step(mm, addr, ptep);
-			if (!ptep)
+			if (WARN_ON_ONCE(!ptep))
 				return;
 		}
 		set_pte_at(mm, addr, ptep, pte_wrprotect(ptep_get(ptep)));
@@ -273,7 +311,9 @@ int huge_ptep_set_access_flags(struct vm_area_struct *vma, unsigned long addr,
  * Size comes from the hstate, NOT from the pte's own size slot: this is the
  * one run-walking hook whose pte is not guaranteed present (mm/rmap.c reaches
  * it for migration entries too), and the swap encoding lays its offset over
- * the size-slot bits {12,13}. hstate_vma() is independent of the pte, which
+ * the size-slot bits (3 bits at {10,12,13}; see the size-slot note in
+ * arch/sh/mm/tlb-jcore.c's jcore_walk_pte()). hstate_vma() does not look at
+ * the pte at all, which
  * is also what arm64 and mips use here.
  *
  * Clear first, then flush, per the ordering note in
