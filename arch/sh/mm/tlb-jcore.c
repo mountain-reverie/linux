@@ -141,6 +141,112 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
 }
 
 /*
+ * jcore_walk_pte() - find the pte that DESCRIBES @addr, at whatever page
+ * size that mapping happens to use. Returns NULL if nothing does.
+ *
+ * A huge pte lives at the pte index of its huge-ALIGNED address -- that is
+ * where huge_pte_alloc() puts it and where every generic mm lookup goes
+ * looking for it (mm/hugetlb.c aligns with huge_page_mask() before every
+ * huge_pte_offset()). The faulting address handed to this walker is the RAW
+ * one, so for any touch past a huge page's first PAGE_SIZE the raw pte index
+ * is NOT the huge pte's index. Probing only the raw index returns -EFAULT,
+ * the generic fault path finds the (aligned) pte already present and repairs
+ * nothing, the access re-executes and faults again -- forever, with not even
+ * a TSB write to show for it (update_mmu_cache() is skipped once the pte is
+ * young, mm/hugetlb.c:6099-6101). docs/mmu/pagemask-walker-contract.md K7.
+ *
+ * So probe FINEST-FIRST, and accept a slot only if the pte found there
+ * claims to be exactly the size we aligned to:
+ *
+ *   slot s covers PAGE_SIZE << 2*s -- 16 KB, 64 KB, ... 256 MB -- which is
+ *   the same ladder jcore_pm_for_slot[] maps to hardware PageMask 1..8
+ *   (<asm/pgtable-bits-jcore.h>), so `s` here and the pte's own size slot
+ *   are the same quantity and the comparison below is exact.
+ *
+ * The size-slot check is what makes a coarse probe unable to steal an
+ * unrelated finer mapping that merely happens to sit at the aligned index:
+ * a base pte there has slot 0, does not equal s, and is rejected. And the
+ * first slot that DOES match is necessarily the mapping for @addr, because
+ * aligning @addr down by that size lands on the page containing it and two
+ * mappings cannot cover one address.
+ *
+ * Cost: a base mapping matches at s = 0, so the hot path is unchanged
+ * except for one equality test. Only a huge mapping, or an address with no
+ * mapping at all, pays for further probes -- bounded at eight, on a path
+ * that is already an exception.
+ *
+ * NOT REDUNDANT WITH THE PTE REPLICATION in arch/sh/mm/hugetlbpage.c, which
+ * would also let a raw-index probe find a usable pte. What this adds is that
+ * the walker resolves at the HEAD slot, so the _PAGE_ACCESSED write-back
+ * below lands on the entry huge_ptep_get() reads. Without it a huge page
+ * would never be seen to go young and huge_ptep_get() would have to
+ * OR-reduce over the whole run -- 16384 reads for a 256 MB page. See the
+ * comment in <asm/hugetlb.h>.
+ */
+static pte_t *jcore_walk_pte(pgd_t *pgd_base, unsigned long addr)
+{
+	/*
+	 * @mask is the in-page offset mask for the slot being probed, grown
+	 * by two bits a step: PAGE_SIZE-1, then 0xFFFF, 0x3FFFF ... 0xFFFFFFF.
+	 * Deliberately NOT `(PAGE_SIZE << (2 * slot)) - 1`: a VARIABLE shift
+	 * on SH-2 is an out-of-line call to __ashlsi3_r0, which is a real cost
+	 * in the TLB-miss path and an undefined symbol for any bare-metal
+	 * harness that links this object without arch/sh/lib (it is exactly
+	 * what sim/tests/mmuhugefar.S hit). `mask << 2` is a constant shift.
+	 */
+	unsigned long mask = PAGE_SIZE - 1;
+	unsigned int slot;
+
+	for (slot = 0; slot < 8; slot++, mask = (mask << 2) | 3) {
+		unsigned long a = addr & ~mask;
+		pgd_t *pgd = pgd_base + pgd_index(a);
+		p4d_t *p4d;
+		pud_t *pud;
+		pmd_t *pmd;
+		pte_t *ptep;
+
+		/*
+		 * A missing level is not fatal here the way it was when this
+		 * was a single straight-line walk: a coarser alignment can
+		 * land in a different pgd entry that does exist (a 256 MB
+		 * page spans four pte tables at PGDIR_SHIFT 26). Keep probing.
+		 */
+		if (pgd_none(*pgd) || pgd_bad(*pgd))
+			continue;
+
+		p4d = p4d_offset(pgd, a);
+		if (p4d_none(*p4d) || p4d_bad(*p4d))
+			continue;
+
+		pud = pud_offset(p4d, a);
+		if (pud_none(*pud) || pud_bad(*pud))
+			continue;
+
+		pmd = pmd_offset(pud, a);
+		if (pmd_none(*pmd) || pmd_bad(*pmd))
+			continue;
+
+		ptep = pte_offset_kernel(pmd, a);
+
+		/*
+		 * _PAGE_VALID first, and only then the size slot. The swap /
+		 * migration-entry encoding lays its offset over pte bits
+		 * 11..31, which includes the size-slot bits {12,13}, so the
+		 * "slot" of a non-present pte is not a size and must never be
+		 * compared against one.
+		 */
+		if (!(pte_val(*ptep) & _PAGE_VALID))
+			continue;
+		if (jcore_pte_size_slot(pte_val(*ptep)) != slot)
+			continue;
+
+		return ptep;
+	}
+
+	return NULL;
+}
+
+/*
  * __jcore_tlb_walk() - software TLB-miss slow path.
  *
  * @pgd:       root of the page table to walk (current_pgd, stashed in the
@@ -150,10 +256,13 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  *             from ASIDR by the asm caller, passed through unchanged. It
  *             becomes tag_lo; tag_hi is computed here from @addr.
  *
- * Two-level walk (pgd -> pte); intermediate pud_offset()/pmd_offset()
- * calls fold away via the generic <asm-generic/pgtable-nop{ud,md}.h>
- * shims for jcore's (non-PAE, non-J64) page-table depth -- no
- * CONFIG_64BIT/PAE arm here, those are a separate, later port.
+ * Two-level walk (pgd -> pte), done by jcore_walk_pte() above, which probes
+ * the page-size ladder finest-first so that a huge mapping is found from any
+ * address inside it and not only from its first PAGE_SIZE. Intermediate
+ * pud_offset()/pmd_offset() calls fold away via the generic
+ * <asm-generic/pgtable-nop{ud,md}.h> shims for jcore's (non-PAE, non-J64)
+ * page-table depth -- no CONFIG_64BIT/PAE arm here, those are a separate,
+ * later port.
  *
  * On success: sets the software _PAGE_ACCESSED bit if unset, builds the
  * hardware PTEL image via jcore_pte_to_ptel(), and rewrites one way of
@@ -167,9 +276,6 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  */
 int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long asid_tag)
 {
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
 	pte_t *ptep;
 	pte_t entry;
 	unsigned long ptel;
@@ -184,27 +290,21 @@ int __jcore_tlb_walk(pgd_t *pgd, unsigned long addr, unsigned long asid_tag)
 	 */
 	BUILD_BUG_ON(PAGE_SHIFT != 14);
 
-	pgd += pgd_index(addr);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
+	/*
+	 * Finest-first, size-slot-checked; _PAGE_VALID is checked inside.
+	 * NOT pte_offset_kernel(pmd, addr) -- see jcore_walk_pte() for why
+	 * the raw pte index is the wrong slot for every huge mapping past its
+	 * first PAGE_SIZE, and what that costs (an unbounded fault loop).
+	 *
+	 * jcore_walk_pte() indexes the pgd itself (pgd_base + pgd_index(a),
+	 * once per probed slot), so `pgd` is passed as the BASE and must not
+	 * be pre-incremented here the way the old open-coded walk did.
+	 */
+	ptep = jcore_walk_pte(pgd, addr);
+	if (!ptep)
 		return -EFAULT;
 
-	p4d = p4d_offset(pgd, addr);
-	if (p4d_none(*p4d) || p4d_bad(*p4d))
-		return -EFAULT;
-
-	pud = pud_offset(p4d, addr);
-	if (pud_none(*pud) || pud_bad(*pud))
-		return -EFAULT;
-
-	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd) || pmd_bad(*pmd))
-		return -EFAULT;
-
-	ptep = pte_offset_kernel(pmd, addr);
 	entry = *ptep;
-
-	if (!(pte_val(entry) & _PAGE_VALID))
-		return -EFAULT;
 
 	if (pte_val(entry) & (_PAGE_PROTNONE | _PAGE_STALE))
 		return -EFAULT;	/* prot-none, or lazy-shootdown stale */
