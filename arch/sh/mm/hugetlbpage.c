@@ -262,6 +262,39 @@ int huge_ptep_set_access_flags(struct vm_area_struct *vma, unsigned long addr,
 }
 #endif /* CONFIG_CPU_JCORE */
 
+/*
+ * huge_ptep_clear_flush() - remove a whole huge mapping and flush it.
+ *
+ * See the long comment at the declaration in <asm/hugetlb.h>: the previous
+ * arch override returned *ptep and cleared nothing, leaving every slot of the
+ * run valid against a folio that try_to_unmap_one()/try_to_migrate_one() had
+ * just rmap-removed.
+ *
+ * Size comes from the hstate, NOT from the pte's own size slot: this is the
+ * one run-walking hook whose pte is not guaranteed present (mm/rmap.c reaches
+ * it for migration entries too), and the swap encoding lays its offset over
+ * the size-slot bits {12,13}. hstate_vma() is independent of the pte, which
+ * is also what arm64 and mips use here.
+ *
+ * Clear first, then flush, per the ordering note in
+ * arch/mips/include/asm/hugetlb.h: a concurrent CPU must not be able to pick
+ * the old entry up again between the flush and the clear.
+ *
+ * Not under CONFIG_CPU_JCORE -- huge_ptep_get_and_clear() is the part that
+ * varies (run-walking on jcore, generic single-slot elsewhere), so this body
+ * is correct for every SH CPU.
+ */
+pte_t huge_ptep_clear_flush(struct vm_area_struct *vma, unsigned long addr,
+			    pte_t *ptep)
+{
+	unsigned long sz = huge_page_size(hstate_vma(vma));
+	pte_t orig;
+
+	orig = huge_ptep_get_and_clear(vma->vm_mm, addr, ptep, sz);
+	flush_tlb_range(vma, addr, addr + sz);
+	return orig;
+}
+
 #ifdef CONFIG_CPU_JCORE
 static __init int jcore_hugetlb_init(void)
 {

@@ -6,12 +6,36 @@
 #include <asm/page.h>
 #include <asm/pgtable.h>
 
+/*
+ * This used to be `return *ptep;` -- it cleared NOTHING and flushed nothing,
+ * while every caller requires the mapping gone:
+ *
+ *   mm/rmap.c:2165 try_to_unmap_one()   take the returned pteval, mark the
+ *   mm/rmap.c:2571 try_to_migrate_one() folio dirty from it, then remove the
+ *                                       rmap;
+ *   mm/hugetlb.c:5581 hugetlb_wp()      installs a new pte over the old one.
+ *
+ * In try_to_unmap_one() only the hwpoison path (mm/rmap.c:2205-2207) rewrites
+ * the entry, so on every other exit the old translation stayed live against a
+ * folio whose rmap had just been dropped.
+ *
+ * That was a ONE-pte bug before huge ptes were replicated. Afterwards it is
+ * one stale pte PER SLOT -- up to 16384 valid entries for a 256 MB page. The
+ * replication in this file is therefore what forces this to be fixed here
+ * rather than filed: it multiplies the pre-existing defect by the run length.
+ *
+ * Now a real implementation, out of line and run-aware, in the shape arm64
+ * (arch/arm64/mm/hugetlbpage.c:476), riscv (arch/riscv/mm/hugetlbpage.c:346)
+ * and mips (arch/mips/include/asm/hugetlb.h:28) all use.
+ *
+ * Deliberately NOT inside CONFIG_CPU_JCORE: the body delegates to
+ * huge_ptep_get_and_clear(), which is the piece that varies by CPU, so the
+ * same code is correct for non-jcore SH -- where it resolves to the generic
+ * single-slot ptep_get_and_clear() -- and fixes the same bug for them.
+ */
 #define __HAVE_ARCH_HUGE_PTEP_CLEAR_FLUSH
-static inline pte_t huge_ptep_clear_flush(struct vm_area_struct *vma,
-					  unsigned long addr, pte_t *ptep)
-{
-	return *ptep;
-}
+pte_t huge_ptep_clear_flush(struct vm_area_struct *vma, unsigned long addr,
+			    pte_t *ptep);
 
 static inline void arch_clear_hugetlb_flags(struct folio *folio)
 {
@@ -67,9 +91,25 @@ static inline pte_t arch_make_huge_pte(pte_t entry, unsigned int shift,
  * huge_ptep_set_access_flags() below, which rewrites the whole run, and the
  * TLB-miss walker through __jcore_tlb_walk() (arch/sh/mm/tlb-jcore.c),
  * which resolves at the huge-ALIGNED address and so writes _PAGE_ACCESSED
- * into the head. That second half is load-bearing: without it the walker
- * would mark whichever slot the fault happened to index and the head would
- * never go young, so a huge page would look permanently cold to reclaim.
+ * into the head.
+ *
+ * THAT SECOND HALF IS LOAD-BEARING, AND NOT FOR THE REASON YOU MIGHT GUESS.
+ * An earlier version of this comment said a permanently-cold head would make
+ * a huge page "look cold to reclaim". That argument is nearly vacuous on this
+ * tree: there is no huge_ptep_test_and_clear_young() or
+ * huge_ptep_clear_flush_young() anywhere, mm/hugetlb.c reads pte_young()
+ * nowhere, and hugetlb folios are not on the LRU and are not reclaimed. The
+ * young bit has essentially no consumer.
+ *
+ * The real cost is a hot-path one, in the fault handler. mm/hugetlb.c:6098
+ * does `vmf.orig_pte = pte_mkyoung(vmf.orig_pte)` and passes it to
+ * huge_ptep_set_access_flags(), and vmf.orig_pte was read via huge_ptep_get()
+ * -- the HEAD. If the walker marks some other slot instead, the head is never
+ * young, pte_mkyoung() always changes it, pte_same() is false on EVERY
+ * hugetlb_fault(), and huge_ptep_set_access_flags() below then rewrites the
+ * entire run: 16384 set_pte_at() plus a 256 MB flush_tlb_range(), per fault,
+ * forever. Resolving at the head makes pte_same() true and the whole thing a
+ * no-op.
  *
  * See docs/mmu/pagemask-walker-contract.md K7 (obligation K7a).
  */

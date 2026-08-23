@@ -178,10 +178,28 @@ void __weak jcore_tlb_walk_mark_accessed(pte_t *ptep, pte_t entry)
  * NOT REDUNDANT WITH THE PTE REPLICATION in arch/sh/mm/hugetlbpage.c, which
  * would also let a raw-index probe find a usable pte. What this adds is that
  * the walker resolves at the HEAD slot, so the _PAGE_ACCESSED write-back
- * below lands on the entry huge_ptep_get() reads. Without it a huge page
- * would never be seen to go young and huge_ptep_get() would have to
- * OR-reduce over the whole run -- 16384 reads for a 256 MB page. See the
- * comment in <asm/hugetlb.h>.
+ * below lands on the entry huge_ptep_get() reads. Two reasons that matters,
+ * in increasing order of force:
+ *
+ *   1. It keeps every hugetlb_fault() cheap. mm/hugetlb.c:6098 does
+ *      `vmf.orig_pte = pte_mkyoung(vmf.orig_pte)` on a value read from the
+ *      HEAD and hands it to huge_ptep_set_access_flags(). Mark some other
+ *      slot instead and the head is never young, so pte_same() is false on
+ *      EVERY fault and the whole run gets rewritten -- 16384 set_pte_at()
+ *      plus a 256 MB flush_tlb_range(), per fault. (An earlier version of
+ *      this comment claimed the cost was reclaim ageing. It is not:
+ *      there is no huge_ptep_test_and_clear_young() or
+ *      huge_ptep_clear_flush_young() on this tree, mm/hugetlb.c reads
+ *      pte_young() nowhere, and hugetlb folios are not on the LRU.)
+ *
+ *   2. It is the only half of the K7 fix a running test can reach. The
+ *      replication lives in generic-mm-facing hooks that no bare-metal
+ *      harness can drive; this function is linked directly by jcore-cpu's
+ *      sim/tests/mmuhugefar.S, which goes red without it. Shipping
+ *      replication alone would mean shipping a livelock fix with no
+ *      executed evidence behind it.
+ *
+ * See the comment in <asm/hugetlb.h>.
  */
 static pte_t *jcore_walk_pte(pgd_t *pgd_base, unsigned long addr)
 {
