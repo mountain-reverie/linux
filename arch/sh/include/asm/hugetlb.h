@@ -19,9 +19,9 @@
  * the entry, so on every other exit the old translation stayed live against a
  * folio whose rmap had just been dropped.
  *
- * That was a ONE-pte bug before huge ptes were replicated. Afterwards it is
- * one stale pte PER SLOT -- up to 16384 valid entries for a 256 MB page. The
- * replication in this file is therefore what forces this to be fixed here
+ * That was a ONE-pte bug before huge ptes were replicated. Unfixed, it would
+ * now be one stale pte PER SLOT -- up to 16384 valid entries for a 256 MB
+ * page. The replication in this file is what forces this to be fixed HERE
  * rather than filed: it multiplies the pre-existing defect by the run length.
  *
  * Now a real implementation, out of line and run-aware, in the shape arm64
