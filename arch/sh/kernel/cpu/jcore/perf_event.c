@@ -20,9 +20,16 @@
  *  2. Counters are never cleared or preloaded.  A perf event's window is
  *     established by rebasing hw_perf_event::prev_count at ->enable() time,
  *     which is also how counts accrued while the event was descheduled are
- *     discarded.  (The RTL deliberately made the counters writable so that
- *     perf could preload a sampling period.  With no PMU interrupt there is no
- *     sampling -- see below -- so that capability is currently unused here.)
+ *     discarded.  The RTL made the counters writable specifically so that perf
+ *     could preload a sampling period; with no PMU interrupt there is no
+ *     sampling (see below), so that capability goes unused -- which is just as
+ *     well, because a counter write is not free.  core/perf.vhd resolves a
+ *     software write racing a hardware event in the same cycle by letting the
+ *     WRITE WIN and DROPPING THE EVENT.  That is the right rule for the RTL --
+ *     it is the only one under which "write N, expect N + k" reasoning works --
+ *     but it means every counter write costs up to one count, and the spec does
+ *     not say so while citing this driver as the reason the write port exists.
+ *     Rebasing prev_count costs nothing and loses nothing.
  *
  *  3. The counters WRAP at 2^32; they do not saturate, and there is no
  *     interrupt on overflow.  See "WRAP HANDLING" and "SAMPLING" below.
@@ -167,6 +174,20 @@ static u64 jcore_pmu_update(struct jcore_pmu_cpu *pc, unsigned int n)
  * for.  A wrap seen at a poll that ran on schedule is expected (PMCYC wraps
  * every 10.7 s at 400 MHz) and silent; a wrap seen after the poll was starved
  * for longer than the interval we promised means counts were lost.
+ *
+ * The counters are read LIVE here.  The spec's section 3.1 recommends taking a
+ * coherent snapshot by clearing PMCR.EN, reading, and setting it again, and
+ * this deliberately does not do that: EN gates EVERY counter, PMCYC included,
+ * so that procedure stops the cycle counter for the whole burst -- for this
+ * sample loop, nine privileged loads and up to three stores -- once per
+ * sample, every second, for as long as any event is live, and PMCYC drifts
+ * away from wall clock by a growing, one-directional amount.  Reading live
+ * costs a few cycles of skew BETWEEN counters instead, which is bounded, is
+ * self-cancelling across samples, and is the same sampling-boundary effect the
+ * spec's section 3.2 already describes as a measured property.  Coherence
+ * across counters buys nothing here anyway: the arch layer reads one counter
+ * per perf event at whatever moment it likes, so this poll is never the thing
+ * that establishes a cross-counter instant.
  */
 static void jcore_pmu_sample_all(struct jcore_pmu_cpu *pc)
 {
@@ -223,8 +244,10 @@ static enum hrtimer_restart jcore_pmu_poll(struct hrtimer *hrt)
  * instruction DISPATCHES; this core has no retirement stage to count instead,
  * and an instruction restarted by a precise exception (TLB fault, P4
  * privilege refusal) is dispatched -- and counted -- again.  Exposing it as
- * INSTRUCTIONS anyway, because: on fault-free code dispatch and retirement
- * coincide exactly (asserted by the RTL guard sim/tests/pmucnt.S check 0x10);
+ * INSTRUCTIONS anyway, because: on a fault-free block PMINS advances by
+ * exactly one per instruction, multi-slot forms included (RTL guards
+ * sim/tests/pmucnt.S checks 0x10 and 0x70), and a fault-free instruction
+ * dispatches and retires exactly once, so there the two readings agree;
  * the divergence is bounded by the restart count, which PMWLK makes visible;
  * and refusing the event would leave IPC -- the measurement this whole task
  * exists to unblock -- unobtainable.  The number is an UPPER BOUND on retired
@@ -303,8 +326,7 @@ static const int jcore_general_events[] = {
 static const int jcore_cache_events
 			[PERF_COUNT_HW_CACHE_MAX]
 			[PERF_COUNT_HW_CACHE_OP_MAX]
-			[PERF_COUNT_HW_CACHE_RESULT_MAX] =
-{
+			[PERF_COUNT_HW_CACHE_RESULT_MAX] = {
 	[C(L1D)] = {
 		[C(OP_READ)] = {
 			[C(RESULT_ACCESS)]	= -1,
@@ -491,8 +513,11 @@ static void jcore_pmu_enable(struct hw_perf_event *hwc, int idx)
  * that its purpose is to FREEZE, not to arm: it resets SET and the counters
  * free-run out of reset.  Using it for perf's pmu_disable/pmu_enable bracket
  * is what makes those callbacks mean what perf's contract says they mean --
- * all eight counters stop together, so a transaction sees a coherent set of
- * values -- and it keeps perf's own add/del work out of the measurement.
+ * all eight counters stop together, so anything read inside the bracket sees a
+ * coherent set of values -- and it keeps perf's own add/del work out of the
+ * measurement.  It is only a bracket around perf's own transactions, though;
+ * the anti-wrap poll runs outside it and deliberately does not freeze, for the
+ * reason given above jcore_pmu_sample_all().
  *
  * Two consequences, neither hidden:
  *
@@ -603,6 +628,13 @@ static int __init jcore_pmu_init(void)
 	}
 
 	jcore_pmu_cnts_mask = cnts;
+
+	/*
+	 * Logged because it is the one fact a bring-up needs and cannot get any
+	 * other way: which counters this particular bitstream actually has.
+	 */
+	pr_info("%u-bit counters, implemented mask %#x (PMIDR %#010x)\n",
+		width, cnts, idr);
 
 	for_each_possible_cpu(cpu) {
 		struct jcore_pmu_cpu *pc = &per_cpu(jcore_pmu_cpu, cpu);
