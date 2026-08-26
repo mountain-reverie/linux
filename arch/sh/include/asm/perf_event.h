@@ -4,7 +4,18 @@
 
 struct hw_perf_event;
 
-#define MAX_HWEVENTS	2
+/*
+ * Upper bound on any registered sh_pmu's num_events, and the size of the
+ * per-CPU slot arrays in arch/sh/kernel/perf_event.c.  sh_pmu_add() indexes
+ * cpu_hw_events::events[] with a slot number drawn from [0, num_events), so
+ * this MUST NOT be smaller than the largest num_events any backend declares
+ * -- the WARN_ON() in register_sh_pmu() fires only after the overrun has
+ * become possible.  Raised from 2 to 8 for the J-Core J4 fixed-function PMU,
+ * whose eight counters all run simultaneously and are individually
+ * shareable; the SH-4 backends still declare 2 and simply leave the rest of
+ * the array unused.
+ */
+#define MAX_HWEVENTS	8
 
 struct sh_pmu {
 	const char	*name;
