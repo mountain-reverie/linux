@@ -105,9 +105,13 @@ static u32 jcore_pmu_cnts_mask __read_mostly;
  * @prev:	raw value of each counter at its last sample
  * @primed:	bit n set once @prev[n] holds a real sample
  * @active:	bit i set while slot i is scheduled, used to run the poll timer
+ * @armed:	true while @poll is expected to keep re-arming itself
  * @slot_cnt:	slot -> counter map, see consequence 1 in the file comment
  * @last_ns:	local_clock() at the last full sample, 0 if there is no live
  *		predecessor to measure a starved poll against
+ * @cyc_per_ms:	cycle rate learned from on-schedule polls, 0 until one pair of
+ *		them has been seen; used only to decide whether a gap was long
+ *		enough to lose counts
  * @poll:	anti-wrap timer, see "WRAP HANDLING" in the file comment
  *
  * The PMU page is per-CPU in hardware, so all of this is per-CPU too.  It is
@@ -122,8 +126,10 @@ struct jcore_pmu_cpu {
 	u32		prev[JCORE_PMU_NR_COUNTERS];
 	unsigned long	primed;
 	unsigned long	active;
+	bool		armed;
 	u8		slot_cnt[MAX_HWEVENTS];
 	u64		last_ns;
+	u32		cyc_per_ms;
 	struct hrtimer	poll;
 };
 
@@ -177,8 +183,24 @@ static u64 jcore_pmu_update(struct jcore_pmu_cpu *pc, unsigned int n)
  * What they can do -- the one question a wrapping counter cannot answer by
  * itself -- is say "you sampled too slowly", and that is what they are used
  * for.  A wrap seen at a poll that ran on schedule is expected (PMCYC wraps
- * every 10.7 s at 400 MHz) and silent; a wrap seen after the poll was starved
- * for longer than the interval we promised means counts were lost.
+ * every 10.7 s at 400 MHz) and silent.
+ *
+ * A WRAP IS NOT BY ITSELF EVIDENCE OF LOSS, and the warning must not claim it
+ * is.  The modular fold handles a single wrap exactly; counts are short only
+ * when a counter's TRUE delta reaches 2^32, which takes 10.7 s at 400 MHz and
+ * 107 s at 40 MHz.  A fixed "the poll was late" threshold would therefore cry
+ * wolf across most of the band in which it can fire.  So the gap is measured
+ * against the cycle rate instead: PMCYC bounds every counter, so no counter
+ * can have advanced 2^32 unless the gap could hold that many cycles.  The rate
+ * is learned from polls that ran on schedule, where PMCYC provably cannot have
+ * wrapped (that is the invariant the interval is chosen to guarantee) and the
+ * folded delta is therefore the true one.  It is a slight UNDER-estimate,
+ * because PMCR.EN briefly freezes the counters around perf's own transactions;
+ * that pushes the threshold later, which is the safe direction for something
+ * whose job is to be believed when it does fire.  Until one pair of
+ * on-schedule polls has been seen there is no rate and no warning -- a false
+ * negative for the first second of the first measurement, taken deliberately
+ * in preference to a false positive.
  *
  * The counters are read LIVE here.  The spec's section 3.1 recommends taking a
  * coherent snapshot by clearing PMCR.EN, reading, and setting it again, and
@@ -197,6 +219,7 @@ static u64 jcore_pmu_update(struct jcore_pmu_cpu *pc, unsigned int n)
 static void jcore_pmu_sample_all(struct jcore_pmu_cpu *pc)
 {
 	u64 now = local_clock();
+	u64 gap, cyc, gap_ms;
 	unsigned int n;
 	u32 ovf;
 
@@ -204,14 +227,27 @@ static void jcore_pmu_sample_all(struct jcore_pmu_cpu *pc)
 	if (ovf)
 		jcore_pmu_writel(ovf, JCORE_PMOVF);	/* write-1-to-clear */
 
+	cyc = pc->total[JCORE_PMU_CYC];
 	for (n = 0; n < JCORE_PMU_NR_COUNTERS; n++)
 		jcore_pmu_update(pc, n);
+	cyc = pc->total[JCORE_PMU_CYC] - cyc;
 
-	if (ovf && pc->last_ns && now - pc->last_ns > 2 * JCORE_PMU_POLL_NS)
-		pr_warn_ratelimited("counters %#x wrapped over a %llu ms gap; counts short by a multiple of 2^32\n",
-				    ovf, div_u64(now - pc->last_ns, NSEC_PER_MSEC));
-
+	gap = pc->last_ns ? now - pc->last_ns : 0;
 	pc->last_ns = now;
+
+	/* An on-schedule gap: PMCYC cannot have wrapped, so @cyc is exact. */
+	if (gap >= NSEC_PER_MSEC && gap <= 2 * JCORE_PMU_POLL_NS)
+		pc->cyc_per_ms = div64_u64(cyc * NSEC_PER_MSEC, gap);
+
+	if (!ovf || !pc->cyc_per_ms)
+		return;
+
+	gap_ms = div_u64(gap, NSEC_PER_MSEC);
+	if ((u64)pc->cyc_per_ms * gap_ms < 1ULL << JCORE_PMU_CNT_BITS)
+		return;
+
+	pr_warn_ratelimited("poll starved %llu ms, long enough to advance a counter 2^32; counters %#x wrapped and their totals may be short\n",
+			    gap_ms, ovf);
 }
 
 static enum hrtimer_restart jcore_pmu_poll(struct hrtimer *hrt)
@@ -224,12 +260,12 @@ static enum hrtimer_restart jcore_pmu_poll(struct hrtimer *hrt)
 	 * away: hrtimers are migrated off a dying CPU and this callback would
 	 * then run somewhere else, where JCORE_PMCNT() addresses the NEW CPU's
 	 * PMU page -- the registers are per-CPU at one fixed address -- and
-	 * would fold that CPU's counts into the dead CPU's shadow.  Bail out
-	 * instead.  perf tears its events down over CPU offline, so the timer
-	 * has nothing left to do; if the CPU comes back, ->enable() re-arms it.
+	 * would fold that CPU's counts into the dead CPU's shadow.  Retire
+	 * instead; perf tears its events down over CPU offline, so there is
+	 * nothing left to poll, and if the CPU comes back ->enable() re-arms.
 	 */
 	if (pc != this_cpu_ptr(&jcore_pmu_cpu))
-		return HRTIMER_NORESTART;
+		goto retire;
 
 	local_irq_save(flags);
 	jcore_pmu_sample_all(pc);
@@ -240,32 +276,53 @@ static enum hrtimer_restart jcore_pmu_poll(struct hrtimer *hrt)
 	 * ->disable() with interrupts already off and, on the timer's own CPU,
 	 * hrtimer_cancel() there would be waiting for a callback that cannot
 	 * run.  Re-arming only while a slot is live keeps an idle CPU idle.
-	 *
-	 * No race with ->enable() re-arming: the timer is pinned and this
-	 * callback is HARD, so it runs in hardirq on the CPU whose shadow it
-	 * owns, while ->enable() runs there with interrupts off.  The two
-	 * cannot interleave, so ->enable()'s hrtimer_active() test either sees
-	 * this callback finished (and re-arms) or sees the timer still queued
-	 * (and this callback observes the freshly set @active bit).
-	 *
-	 * Forget the sample timestamp on the way out.  @last_ns exists to spot
-	 * a STARVED poll, and the gap across an idle period when no event was
-	 * scheduled is not that.  Leaving it set would make the first poll of
-	 * the next measurement compare against an arbitrarily old sample and
-	 * warn about lost counts -- and it would nearly always warn, since the
-	 * counters free-run whether or not perf is watching, so PMOVF is
-	 * essentially certain to be set after any long gap.  Only the debug
-	 * shadow is short across such a gap; event counts are untouched,
-	 * because ->enable() rebases prev_count after the fold.
 	 */
-	if (!READ_ONCE(pc->active)) {
-		pc->last_ns = 0;
-		return HRTIMER_NORESTART;
-	}
+	if (!READ_ONCE(pc->active))
+		goto retire;
 
 	hrtimer_forward_now(hrt, ns_to_ktime(JCORE_PMU_POLL_NS));
 
 	return HRTIMER_RESTART;
+
+retire:
+	/*
+	 * Both exits land here, and both must leave the CPU in a state from
+	 * which ->enable() will start a fresh poll.
+	 *
+	 * @armed, not hrtimer_active(), is what ->enable() tests, and the
+	 * difference is a silent loss of the anti-wrap guarantee.
+	 * hrtimer_active() is true whenever the timer is enqueued on ANY base,
+	 * and migrate_hrtimer_list() deliberately re-enqueues a migrated timer.
+	 * So a CPU that offlines and re-onlines inside one poll period leaves
+	 * its timer queued on the CPU that inherited it; ->enable() on the
+	 * revived CPU would see "active" and skip hrtimer_start(); the migrated
+	 * timer would then expire, take the bail-out above, and stop for good.
+	 * The CPU would be left with a live event and no poll at all -- and no
+	 * diagnostic either, because the starved-poll warning lives inside the
+	 * poll that is not running.  Owning the flag makes that unrepresentable:
+	 * every path that returns HRTIMER_NORESTART clears it.
+	 *
+	 * The flag is advisory across CPUs and does not need to be otherwise.
+	 * In the migration window a losing update either leaves @armed false
+	 * with the timer queued (the next ->enable() re-arms it, moving the
+	 * deadline out by one period) or leaves it true with the timer queued
+	 * by that same ->enable() (correct).  Neither can produce @armed true
+	 * with nothing queued, which is the only state that would stop the poll.
+	 *
+	 * @last_ns is dropped for the reason the starved-poll warning exists at
+	 * all: it is there to spot a poll that was late, and an interval during
+	 * which no poll was supposed to run is not that.  Keeping it would make
+	 * the first poll of the next measurement measure the whole idle gap and
+	 * warn -- and warn nearly every time, since the counters free-run
+	 * whether or not perf is watching, so PMOVF is close to certain to be
+	 * set after any long gap.  Only the debug shadow is short across such a
+	 * gap; event counts are untouched, because ->enable() rebases
+	 * prev_count after the fold.
+	 */
+	pc->last_ns = 0;
+	WRITE_ONCE(pc->armed, false);
+
+	return HRTIMER_NORESTART;
 }
 
 /*
@@ -537,9 +594,11 @@ static void jcore_pmu_enable(struct hw_perf_event *hwc, int idx)
 	local64_set(&hwc->prev_count, jcore_pmu_update(pc, pc->slot_cnt[idx]));
 	__set_bit(idx, &pc->active);
 
-	if (!hrtimer_active(&pc->poll))
+	if (!READ_ONCE(pc->armed)) {
+		WRITE_ONCE(pc->armed, true);
 		hrtimer_start(&pc->poll, ns_to_ktime(JCORE_PMU_POLL_NS),
 			      HRTIMER_MODE_REL_PINNED_HARD);
+	}
 
 	local_irq_restore(flags);
 }
@@ -592,9 +651,16 @@ static struct sh_pmu jcore_pmu = {
 	 * Not a count of hardware counters -- it is the number of perf events
 	 * the arch layer may schedule on one CPU at a time.  Fixed-function
 	 * counters are shareable (see the file comment), so this is a driver
-	 * choice; eight lets every event this driver knows about be counted
-	 * simultaneously, which is the whole reason the RTL is fixed-function
-	 * rather than multiplexed.
+	 * choice, not a hardware limit; eight lets every event this driver
+	 * knows about be counted simultaneously, which is the whole reason the
+	 * RTL is fixed-function rather than multiplexed.
+	 *
+	 * The tradeoff, stated because the number looks like a hardware fact
+	 * and is not: a ninth concurrent event makes perf multiplex and scale,
+	 * on hardware that could have counted all nine exactly.  Raising it
+	 * means raising MAX_HWEVENTS with it, since that sizes the arch layer's
+	 * per-CPU arrays for every sh backend; eight is where those two costs
+	 * were balanced, not where the hardware stops.
 	 */
 	.num_events	= JCORE_PMU_NR_COUNTERS,
 	.event_map	= jcore_pmu_event_map,
@@ -659,9 +725,9 @@ static int __init jcore_pmu_init(void)
 	 * build is the case that does not exist yet.  If one ever ships, the
 	 * fix is per-event filtering, not a silently degraded PMU.
 	 */
-	if (width != 32) {
-		pr_warn("PMIDR reports %u-bit counters, driver assumes 32\n",
-			width);
+	if (width != JCORE_PMU_CNT_BITS) {
+		pr_warn("PMIDR reports %u-bit counters, driver assumes %u\n",
+			width, JCORE_PMU_CNT_BITS);
 		return -ENODEV;
 	}
 
@@ -689,9 +755,12 @@ static int __init jcore_pmu_init(void)
 
 	/*
 	 * Clear any wrap flags accumulated since reset, so that the first one
-	 * the poll reports is one this driver could have prevented.
+	 * the poll reports is one this driver could have prevented.  Written
+	 * with the implemented-counter mask just read, not with the PMIDR field
+	 * width: the two are numerically identical today and mean different
+	 * things, and this register's data is a set of counter bits.
 	 */
-	jcore_pmu_writel(JCORE_PMIDR_CNTS_MASK, JCORE_PMOVF);
+	jcore_pmu_writel(cnts, JCORE_PMOVF);
 
 	return register_sh_pmu(&jcore_pmu);
 }

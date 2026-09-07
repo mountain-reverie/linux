@@ -47,6 +47,13 @@
 
 #define JCORE_PMU_NR_COUNTERS	8
 
+/*
+ * Counter width, as PMIDR[15:8] reports it.  Software that reconstructs a
+ * 64-bit total across the wrap is only correct for this width, so a driver
+ * should check the field rather than assume the constant.
+ */
+#define JCORE_PMU_CNT_BITS	32
+
 #define JCORE_PMU_CYC		0	/* cycles (a level, not a pulse) */
 #define JCORE_PMU_INS		1	/* instruction DISPATCHES, not retires */
 #define JCORE_PMU_IFR		2	/* completed instruction-fetch bus reads */
@@ -55,5 +62,14 @@
 #define JCORE_PMU_DAW		5	/* cycles with a data access outstanding, unacked */
 #define JCORE_PMU_WLK		6	/* TSB walks armed (I-side AND D-side) */
 #define JCORE_PMU_WHT		7	/* TSB walks that found a usable PTE */
+
+/*
+ * Counters 6 and 7 ARE the architected P4_TSBCNT register at 0xFF000054,
+ * which the RTL now serves as PMWLK[15:0]:PMWHT[15:0] -- core/tlb_walk.vhd
+ * holds no counter state of its own any more.  TSBCNT is therefore NOT
+ * independent of this page: clearing PMCR.EN freezes it, and writing counter
+ * 6 or 7 sets it.  Anyone editing the P4 map, or virtualizing TSBCNT for a
+ * guest, has to treat the two as one thing.
+ */
 
 #endif /* __ASM_CPU_JCORE_PERF_EVENT_H */
