@@ -42,13 +42,17 @@
  * at 16 bits.  Nothing in perf guarantees a counting event is read often
  * enough, so this driver supplies the guarantee itself: while any event is
  * scheduled on a CPU, a pinned per-CPU hrtimer samples every implemented
- * counter once a second.  One second bounds the fastest counter (PMCYC, one
- * per cycle) below 2^32 for any core clock under 4.29 GHz, so no frequency
- * knowledge is needed.  The residual failure mode is honest and narrow: if
- * that timer is starved for longer than the wrap period -- a very long
- * irq-disabled section, or suspend -- counts are lost in units of 2^32.  PMOVF
- * cannot repair this (one sticky bit cannot distinguish one wrap from five)
- * but it can report it, so the poll uses it to warn rather than to correct.
+ * counter once a second.  PMCYC bounds all eight: it is the only event wired
+ * as a LEVEL (core/cpu.vhd asserts pmu_ev(PMU_CYC) unconditionally) and every
+ * other event is at most one pulse per cycle, so no counter can advance faster
+ * than the cycle counter.  One second therefore holds the fastest possible
+ * advance below 2^32 for any core clock under 2^32 Hz, which is both targets
+ * with room to spare, and needs no frequency knowledge.  The residual failure
+ * mode is honest and narrow: if that timer is starved past the wrap period --
+ * a very long irq-disabled section, or suspend -- counts are lost in units of
+ * 2^32.  PMOVF cannot repair this (one sticky bit cannot distinguish one wrap
+ * from five) but it can report it, so the poll uses it to warn rather than to
+ * correct.
  *
  * SAMPLING.  There is NO PMU interrupt.  The RTL half left that to SoC level:
  * it needs an AIC2 source line, which is not a core-level change.  PMOVF is a
@@ -102,7 +106,8 @@ static u32 jcore_pmu_cnts_mask __read_mostly;
  * @primed:	bit n set once @prev[n] holds a real sample
  * @active:	bit i set while slot i is scheduled, used to run the poll timer
  * @slot_cnt:	slot -> counter map, see consequence 1 in the file comment
- * @last_ns:	local_clock() at the last full (all-counter) sample
+ * @last_ns:	local_clock() at the last full sample, 0 if there is no live
+ *		predecessor to measure a starved poll against
  * @poll:	anti-wrap timer, see "WRAP HANDLING" in the file comment
  *
  * The PMU page is per-CPU in hardware, so all of this is per-CPU too.  It is
@@ -214,6 +219,18 @@ static enum hrtimer_restart jcore_pmu_poll(struct hrtimer *hrt)
 	struct jcore_pmu_cpu *pc = container_of(hrt, struct jcore_pmu_cpu, poll);
 	unsigned long flags;
 
+	/*
+	 * The timer is pinned, but "pinned" does not survive its CPU going
+	 * away: hrtimers are migrated off a dying CPU and this callback would
+	 * then run somewhere else, where JCORE_PMCNT() addresses the NEW CPU's
+	 * PMU page -- the registers are per-CPU at one fixed address -- and
+	 * would fold that CPU's counts into the dead CPU's shadow.  Bail out
+	 * instead.  perf tears its events down over CPU offline, so the timer
+	 * has nothing left to do; if the CPU comes back, ->enable() re-arms it.
+	 */
+	if (pc != this_cpu_ptr(&jcore_pmu_cpu))
+		return HRTIMER_NORESTART;
+
 	local_irq_save(flags);
 	jcore_pmu_sample_all(pc);
 	local_irq_restore(flags);
@@ -223,9 +240,28 @@ static enum hrtimer_restart jcore_pmu_poll(struct hrtimer *hrt)
 	 * ->disable() with interrupts already off and, on the timer's own CPU,
 	 * hrtimer_cancel() there would be waiting for a callback that cannot
 	 * run.  Re-arming only while a slot is live keeps an idle CPU idle.
+	 *
+	 * No race with ->enable() re-arming: the timer is pinned and this
+	 * callback is HARD, so it runs in hardirq on the CPU whose shadow it
+	 * owns, while ->enable() runs there with interrupts off.  The two
+	 * cannot interleave, so ->enable()'s hrtimer_active() test either sees
+	 * this callback finished (and re-arms) or sees the timer still queued
+	 * (and this callback observes the freshly set @active bit).
+	 *
+	 * Forget the sample timestamp on the way out.  @last_ns exists to spot
+	 * a STARVED poll, and the gap across an idle period when no event was
+	 * scheduled is not that.  Leaving it set would make the first poll of
+	 * the next measurement compare against an arbitrarily old sample and
+	 * warn about lost counts -- and it would nearly always warn, since the
+	 * counters free-run whether or not perf is watching, so PMOVF is
+	 * essentially certain to be set after any long gap.  Only the debug
+	 * shadow is short across such a gap; event counts are untouched,
+	 * because ->enable() rebases prev_count after the fold.
 	 */
-	if (!READ_ONCE(pc->active))
+	if (!READ_ONCE(pc->active)) {
+		pc->last_ns = 0;
 		return HRTIMER_NORESTART;
+	}
 
 	hrtimer_forward_now(hrt, ns_to_ktime(JCORE_PMU_POLL_NS));
 
@@ -531,15 +567,23 @@ static void jcore_pmu_enable(struct hw_perf_event *hwc, int idx)
  *    freezing them freezes that register too.  Nothing in arch/sh reads it
  *    today, but a hypervisor virtualizing TSBCNT must virtualize this page
  *    with it, exactly as the spec says.
+ *
+ * Read-modify-write rather than a plain store, as the spec's section 2.1
+ * requires: PMCR[31:1] are plain read/write flops, not RAZ/WI, so a store of a
+ * bare EN would clear anything a future revision puts up there.  It is only
+ * bit 0 today and a plain store would be correct today; the point is that the
+ * day it stops being correct, nothing here would fail visibly.
  */
 static void jcore_pmu_disable_all(void)
 {
-	jcore_pmu_writel(0, JCORE_PMCR);
+	jcore_pmu_writel(jcore_pmu_readl(JCORE_PMCR) & ~JCORE_PMCR_EN,
+			 JCORE_PMCR);
 }
 
 static void jcore_pmu_enable_all(void)
 {
-	jcore_pmu_writel(JCORE_PMCR_EN, JCORE_PMCR);
+	jcore_pmu_writel(jcore_pmu_readl(JCORE_PMCR) | JCORE_PMCR_EN,
+			 JCORE_PMCR);
 }
 
 static struct sh_pmu jcore_pmu = {
