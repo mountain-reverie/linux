@@ -6,6 +6,7 @@
 obj-y			:= alignment.o cache.o init.o consistent.o mmap.o
 
 cacheops-$(CONFIG_CPU_J2)		:= cache-j2.o
+cacheops-$(CONFIG_CPU_JCORE)		:= cache-jcore.o
 cacheops-$(CONFIG_CPU_SUBTYPE_SH7619)	:= cache-sh2.o
 cacheops-$(CONFIG_CPU_SH2A)		:= cache-sh2a.o
 cacheops-$(CONFIG_CPU_SH3)		:= cache-sh3.o

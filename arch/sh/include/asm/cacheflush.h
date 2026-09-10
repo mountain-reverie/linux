@@ -30,6 +30,8 @@ extern void (*local_flush_cache_sigtramp)(void *args);
 
 static inline void cache_noop(void *args) { }
 
+void cacheop_on_each_cpu(void (*func)(void *info), void *info, int wait);
+
 extern void (*__flush_wback_region)(void *start, int size);
 extern void (*__flush_purge_region)(void *start, int size);
 extern void (*__flush_invalidate_region)(void *start, int size);
@@ -107,6 +109,7 @@ void cpu_cache_init(void);
 void __weak l2_cache_init(void);
 
 void __weak j2_cache_init(void);
+void __weak jcore_cache_init(void);
 void __weak sh2_cache_init(void);
 void __weak sh2a_cache_init(void);
 void __weak sh3_cache_init(void);

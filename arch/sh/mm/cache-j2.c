@@ -7,11 +7,13 @@
 
 #include <linux/init.h>
 #include <linux/mm.h>
-#include <linux/cpumask.h>
+#include <linux/preempt.h>
+#include <linux/smp.h>
 
 #include <asm/cache.h>
 #include <asm/addrspace.h>
 #include <asm/processor.h>
+#include <asm/smp.h>
 #include <asm/cacheflush.h>
 #include <asm/io.h>
 
@@ -24,25 +26,44 @@
 
 u32 __iomem *j2_ccr_base;
 
+/*
+ * Write the issuing core's own cache-control word, and no other.
+ *
+ * These three used to loop over for_each_possible_cpu(), which reached
+ * every *other* core's whole-cache invalidate bits through the per-core
+ * window of the same register -- the cross-domain reach
+ * docs/cache/l2-spec.md 16.2 "P-R8" forbids, on the register P-R8 says the
+ * SoC ships outside P4. The cross-core reach the loop provided is now taken
+ * from the IPI in cacheop_on_each_cpu(), which grew a CONFIG_CPU_J2 arm in
+ * the same change.
+ *
+ * Preemption is disabled across the whole sequence, not just the read of
+ * the CPU id: migrating between picking the word and writing it would
+ * reintroduce exactly the cross-core write being removed.
+ */
+static void j2_flush_ccr(u32 bits)
+{
+	unsigned int cpu;
+
+	preempt_disable();
+	cpu = hard_smp_processor_id();
+	__raw_writel(bits, j2_ccr_base + cpu);
+	preempt_enable();
+}
+
 static void j2_flush_icache(void *args)
 {
-	unsigned cpu;
-	for_each_possible_cpu(cpu)
-		__raw_writel(CACHE_ENABLE | ICACHE_FLUSH, j2_ccr_base + cpu);
+	j2_flush_ccr(CACHE_ENABLE | ICACHE_FLUSH);
 }
 
 static void j2_flush_dcache(void *args)
 {
-	unsigned cpu;
-	for_each_possible_cpu(cpu)
-		__raw_writel(CACHE_ENABLE | DCACHE_FLUSH, j2_ccr_base + cpu);
+	j2_flush_ccr(CACHE_ENABLE | DCACHE_FLUSH);
 }
 
 static void j2_flush_both(void *args)
 {
-	unsigned cpu;
-	for_each_possible_cpu(cpu)
-		__raw_writel(CACHE_ENABLE | CACHE_FLUSH, j2_ccr_base + cpu);
+	j2_flush_ccr(CACHE_ENABLE | CACHE_FLUSH);
 }
 
 void __init j2_cache_init(void)

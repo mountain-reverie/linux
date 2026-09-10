@@ -31,3 +31,28 @@ void arch_sync_dma_for_device(phys_addr_t paddr, size_t size,
 		BUG();
 	}
 }
+
+void arch_sync_dma_for_cpu(phys_addr_t paddr, size_t size,
+		enum dma_data_direction dir)
+{
+	void *addr = sh_cacheop_vaddr(phys_to_virt(paddr));
+
+	switch (dir) {
+	case DMA_TO_DEVICE:
+		/*
+		 * The device only read; nothing the CPU holds went stale.
+		 */
+		break;
+	case DMA_FROM_DEVICE:
+	case DMA_BIDIRECTIONAL:
+		/*
+		 * The device wrote into the buffer behind the caches, so any
+		 * line the CPU still holds for it is stale and must go before
+		 * the CPU reads it back.
+		 */
+		__flush_invalidate_region(addr, size);
+		break;
+	default:
+		BUG();
+	}
+}
