@@ -36,13 +36,23 @@ static inline void noop__flush_region(void *start, int size)
 {
 }
 
-static inline void cacheop_on_each_cpu(void (*func) (void *info), void *info,
-                                   int wait)
+void cacheop_on_each_cpu(void (*func)(void *info), void *info, int wait)
 {
 	preempt_disable();
 
-	/* Needing IPI for cross-core flush is SHX3-specific. */
-#ifdef CONFIG_CPU_SHX3
+	/*
+	 * Cross-core flush needs an IPI wherever the cache-control facility
+	 * only reaches the issuing core's own caches.
+	 *
+	 * That used to read "Needing IPI for cross-core flush is
+	 * SHX3-specific", and it was only true of J-Core because
+	 * cache-j2.c reached every core's invalidate bits through the
+	 * per-core window of the shared cache-control register. That reach
+	 * is the cross-domain write docs/cache/l2-spec.md 16.2 "P-R8"
+	 * forbids; cache-j2.c and cache-jcore.c now write their own word
+	 * only, so both need the IPI here.
+	 */
+#if defined(CONFIG_CPU_SHX3) || defined(CONFIG_CPU_J2) || defined(CONFIG_CPU_JCORE)
 	/*
 	 * It's possible that this gets called early on when IRQs are
 	 * still disabled due to ioremapping by the boot CPU, so don't
@@ -321,6 +331,15 @@ void __init cpu_cache_init(void)
 
 	if (boot_cpu_data.type == CPU_J2) {
 		j2_cache_init();
+	} else if (boot_cpu_data.type == CPU_JCORE) {
+		/*
+		 * Must precede the CPU_FAMILY_SH2 arm: the J4 sets that
+		 * family too, and sh2_cache_init() is only ever defined by
+		 * cache-sh2.c, which a CONFIG_CPU_JCORE build does not
+		 * compile. Its __weak declaration then resolves to address
+		 * zero, so falling through here was a call to NULL.
+		 */
+		jcore_cache_init();
 	} else if (boot_cpu_data.family == CPU_FAMILY_SH2) {
 		sh2_cache_init();
 	}
