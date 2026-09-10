@@ -76,16 +76,25 @@ asmlinkage int sys_cacheflush(unsigned long addr, unsigned long len, int op)
 		return -EFAULT;
 	}
 
-	switch (op & CACHEFLUSH_D_PURGE) {
-		case CACHEFLUSH_D_INVAL:
-			__flush_invalidate_region((void *)addr, len);
-			break;
-		case CACHEFLUSH_D_WB:
-			__flush_wback_region((void *)addr, len);
-			break;
-		case CACHEFLUSH_D_PURGE:
-			__flush_purge_region((void *)addr, len);
-			break;
+	/*
+	 * The data side is skipped on parts where the only primitive available
+	 * reaches far past the range the caller named and is not needed for
+	 * anything the caller can observe. cacheflush_user_dside_acts() says
+	 * which parts and why; success is still the honest return there,
+	 * because nothing the caller asked to be made visible is left hidden.
+	 */
+	if (cacheflush_user_dside_acts()) {
+		switch (op & CACHEFLUSH_D_PURGE) {
+			case CACHEFLUSH_D_INVAL:
+				__flush_invalidate_region((void *)addr, len);
+				break;
+			case CACHEFLUSH_D_WB:
+				__flush_wback_region((void *)addr, len);
+				break;
+			case CACHEFLUSH_D_PURGE:
+				__flush_purge_region((void *)addr, len);
+				break;
+		}
 	}
 
 	if (op & CACHEFLUSH_I)

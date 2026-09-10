@@ -122,6 +122,51 @@ static void jcore_flush_both(void *args)
  * dma_sync_*(). Since the CCR word is per core, that reach has to be an
  * IPI; cacheop_on_each_cpu() is where it lives, and it only sends one when
  * more than one CPU is online.
+ *
+ * These helpers have two callers with different needs, and the asymmetry
+ * between them is deliberate. Read this before "fixing" it.
+ *
+ * The DMA path -- arch_sync_dma_for_cpu()/_for_device() -- must invalidate,
+ * or a device write is never seen. It keeps them.
+ *
+ * sys_cacheflush(2) must not. It is unprivileged and validates only that the
+ * range lies in one of the caller's own VMAs, so with these helpers behind it
+ * a process holding a single page can invalidate the entire L1-D as often as
+ * it likes: the CCR's dc_inv clears every valid bit in one cycle
+ * (jcore-cpu:cache/dcache_ccl.vhm) and cacheop_on_each_cpu() carries it to
+ * every online core. That is a denial of service against everything else on
+ * the machine and the Flush half of a Flush+Reload. It is also new: before
+ * this file existed the J4 had no cacheops arm, sys_cacheflush(2) resolved to
+ * noop__flush_region() and did nothing, so no J4 userspace can depend on the
+ * data side doing work. asm/cacheflush.h's cacheflush_user_dside_acts() is
+ * where the syscall stops.
+ *
+ * Nothing correct is lost by stopping it:
+ *
+ *  - CACHEFLUSH_D_WB has nothing to do, for the write-through reason above.
+ *  - CACHEFLUSH_D_INVAL and _D_PURGE exist so a process can re-read memory
+ *    that a device wrote behind the cache. Userspace cannot hold such a
+ *    buffer cached in the first place: dma_mmap_*() maps coherent memory
+ *    through dma_pgprot() -> pgprot_noncached(), which on SH is
+ *    pgprot_writecombine() and clears _PAGE_CACHABLE (asm/pgtable_32.h), and
+ *    a streaming mapping is synced by the kernel in arch_sync_dma_for_cpu(),
+ *    not by the process that owns the pages.
+ *  - Neither honoured start/size anyway, so no range semantics are being
+ *    withdrawn -- there were none to withdraw.
+ *
+ * Revisit that decision if the L1-D becomes write-back (decisions/0007
+ * decision 2), or if a cached user mapping of a DMA buffer becomes reachable.
+ * Do not revisit it merely because the two callers now call different things.
+ *
+ * CACHEFLUSH_I is *not* gated, and stays as an accepted residual with a
+ * stated reason. Self-modifying code and JITs need an I-cache invalidate to
+ * be correct; the CCR offers only the whole-cache one; and a JIT that writes
+ * on one core and branches to the code on another needs the IPI as well. So
+ * an unprivileged whole-L1-I invalidate stays reachable. It is a weaker
+ * primitive than the data-side one -- the I-cache holds no data, which makes
+ * it a denial of service and an eviction-timing signal rather than a data
+ * channel -- and docs/security/threat-model.md section 8, item L5 records it
+ * as accepted rather than closed.
  */
 static void jcore__flush_wback_region(void *start, int size)
 {

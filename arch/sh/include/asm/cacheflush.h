@@ -36,6 +36,32 @@ extern void (*__flush_wback_region)(void *start, int size);
 extern void (*__flush_purge_region)(void *start, int size);
 extern void (*__flush_invalidate_region)(void *start, int size);
 
+/*
+ * Whether the data-side operations of sys_cacheflush(2) are performed.
+ *
+ * They are everywhere except J-Core, and the exception is about the syscall
+ * being unprivileged rather than about the cache. The three helpers above
+ * honour start/size on every other SH part; on J-Core they cannot, because
+ * the cache-control register has whole-cache invalidate bits and no
+ * line-granular operation at all (jcore-cpu:cache/icache_modereg.vhm), so
+ * they ignore start/size and invalidate the whole L1-D. sys_cacheflush()
+ * validates only that the range is in one of the caller's own VMAs, which
+ * makes any one page a licence to wipe the data cache in a loop.
+ *
+ * Skipping it costs nothing, because the J-Core L1-D is write-through: main
+ * memory already holds every byte the caller has stored. arch_sync_dma_for_*()
+ * still calls the real helpers -- it is the opposite direction, a device
+ * wrote behind the cache, and it is not reachable by an unprivileged caller.
+ * The full argument, and why that asymmetry is deliberate, is in
+ * arch/sh/mm/cache-jcore.c beside the helpers themselves.
+ *
+ * CACHEFLUSH_I is deliberately not covered: see the same comment.
+ */
+static inline bool cacheflush_user_dside_acts(void)
+{
+	return !IS_ENABLED(CONFIG_CPU_JCORE);
+}
+
 extern void flush_cache_all(void);
 extern void flush_cache_mm(struct mm_struct *mm);
 extern void flush_cache_dup_mm(struct mm_struct *mm);
